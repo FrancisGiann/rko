@@ -1,0 +1,15 @@
+# Version-pinned Windows build inputs. This file is for the manual Windows
+# workflow only; no Windows install/build was run on the Fedora host.
+altgraph==0.17.5
+bottle==0.13.4
+clr-loader==0.2.9
+packaging==26.3
+pefile==2024.8.26
+proxy-tools==0.1.0
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9
+pythonnet==3.0.5
+pywebview==6.2.1
+pywin32-ctypes==0.2.3
+setuptools==84.2.1
+typing-extensions==4.16.0

@@ -9,6 +9,7 @@ import json
 import math
 import os
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -419,9 +420,19 @@ class ForwardCohort:
 
     @staticmethod
     def _config() -> dict:
-        implementation = {}
-        for path in (Path(__file__), Path(market.__file__), Path(risk.__file__)):
-            implementation[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        if getattr(sys, "frozen", False):
+            try:
+                from desktop_build_info import SOURCE_SHA256
+                implementation = dict(SOURCE_SHA256)
+            except (ImportError, TypeError, ValueError) as exc:
+                raise RuntimeError("Frozen build is missing its verified trading-source fingerprint.") from exc
+            if not implementation or any(not isinstance(name, str) or not isinstance(digest, str) or len(digest) != 64
+                                          for name, digest in implementation.items()):
+                raise RuntimeError("Frozen build trading-source fingerprint is invalid.")
+        else:
+            implementation = {}
+            for path in (Path(__file__), Path(market.__file__), Path(risk.__file__)):
+                implementation[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
         policy_path = Path(__file__).with_name("forward_policy_v5_addendum.json")
         policy_sha = hashlib.sha256(policy_path.read_bytes()).hexdigest()
         return {"source": SOURCE, "symbols": list(SYMBOLS), "strategies": list(STRATEGIES),

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,19 +18,40 @@ from research_jobs import ResearchJobs, research_state
 from research_v5_view import HistoricalV5Summary
 
 ROOT = Path(__file__).resolve().parent
+_SERVER_CONTROL_INIT = threading.Lock()
+
+
+def desktop_token_matches(supplied: object, expected: object) -> bool:
+    """Reject malformed header strings before constant-time ASCII comparison."""
+    if not isinstance(supplied, str) or not isinstance(expected, str) or not supplied or not supplied.isascii():
+        return False
+    try:
+        return hmac.compare_digest(supplied, expected)
+    except (TypeError, ValueError):
+        return False
 
 
 def handler_for(lab: Lab, research_jobs: ResearchJobs | None = None,
                 forward_cohort: ForwardCohort | None = None,
-                historical_v5: HistoricalV5Summary | None = None):
+                historical_v5: HistoricalV5Summary | None = None,
+                desktop_token: str | None = None,
+                static_root: Path | None = None,
+                read_only_desktop: bool = False):
     research_jobs = research_jobs or ResearchJobs()
     historical_v5 = historical_v5 or HistoricalV5Summary()
+    static_root = Path(static_root or ROOT)
     class Handler(BaseHTTPRequestHandler):
-        server_version = "RKO/5.2"
+        server_version = "RKO/5.3"
 
         def allowed_host(self) -> bool:
             port = self.server.server_address[1]
             return self.headers.get("Host", "") in {f"127.0.0.1:{port}", f"localhost:{port}"}
+
+        def allowed_api(self, path: str) -> bool:
+            if desktop_token is None or not path.startswith("/api/"):
+                return True
+            supplied = self.headers.get("X-RKO-Desktop-Token", "")
+            return desktop_token_matches(supplied, desktop_token)
 
         def send_bytes(self, code: int, body: bytes, mime: str, *, download: str | None = None):
             self.send_response(code)
@@ -51,6 +74,8 @@ def handler_for(lab: Lab, research_jobs: ResearchJobs | None = None,
             if not self.allowed_host():
                 return self.json(403, {"error": "Unexpected local Host header."})
             parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path.startswith("/api/") and not self.allowed_api(parsed.path):
+                return self.json(403, {"error": "Desktop authorization is required."})
             query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
             try:
                 if parsed.path == "/api/health":
@@ -79,7 +104,7 @@ def handler_for(lab: Lab, research_jobs: ResearchJobs | None = None,
                 if asset is None:
                     return self.json(404, {"error": "Not found."})
                 mime = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml"}[Path(asset).suffix]
-                self.send_bytes(200, (ROOT / asset).read_bytes(), mime + "; charset=utf-8")
+                self.send_bytes(200, (static_root / asset).read_bytes(), mime + "; charset=utf-8")
             except ValueError as exc:
                 self.json(400, {"error": str(exc)})
             except Exception:
@@ -89,15 +114,30 @@ def handler_for(lab: Lab, research_jobs: ResearchJobs | None = None,
         def do_POST(self):
             if not self.allowed_host():
                 return self.json(403, {"error": "Unexpected local Host header."})
+            path = urllib.parse.urlsplit(self.path).path
+            if path.startswith("/api/") and not self.allowed_api(path):
+                return self.json(403, {"error": "Desktop authorization is required."})
             port = self.server.server_address[1]
             origin = self.headers.get("Origin")
             if (origin and origin not in {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}) or self.headers.get("Sec-Fetch-Site") == "cross-site":
                 return self.json(403, {"error": "Cross-origin changes are blocked."})
             if self.headers.get("X-Crypto-Lab") != "1" or self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 return self.json(403, {"error": "Local JSON control header required."})
-            path = urllib.parse.urlsplit(self.path).path
             if path not in {"/api/control", "/api/research/v4", "/api/forward/v5"}:
                 return self.json(404, {"error": "Not found."})
+            if not hasattr(self.server, "_control_lock"):
+                with _SERVER_CONTROL_INIT:
+                    if not hasattr(self.server, "_control_lock"):
+                        self.server._control_lock = threading.RLock()
+                        self.server._closing = False
+            with self.server._control_lock:
+                if self.server._closing:
+                    return self.json(503, {"error": "The desktop app is closing; new controls are blocked."})
+                if read_only_desktop:
+                    return self.json(403, {"error": "This offline diagnostic instance is read-only."})
+                self._handle_post(path)
+
+        def _handle_post(self, path: str):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 1 <= length <= 4096:
@@ -134,6 +174,104 @@ def handler_for(lab: Lab, research_jobs: ResearchJobs | None = None,
                 raise
 
     return Handler
+
+
+def create_server(db_path: Path, *, port: int = 0, desktop_token: str | None = None,
+                  research_root: Path | None = None, asset_root: Path | None = None,
+                  forward_path: Path | None = None, read_only_desktop: bool = False):
+    """Construct an owned loopback server; port=0 asks the OS for a free port."""
+    data_path = Path(db_path)
+    data_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if asset_root is None:
+        asset_root = ROOT
+    if research_root is None:
+        from archive_data import DATA_ROOT
+        research_root = DATA_ROOT.parent
+    research_root = Path(research_root)
+    v4_root = research_root / "v4"
+    research_jobs = ResearchJobs(v4_root)
+    forward_path = Path(forward_path) if forward_path else data_path.parent / "forward_v5" / (data_path.stem + "_cohort.sqlite3")
+    forward_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lab = Lab(data_path)
+    historical_v5 = HistoricalV5Summary(
+        studies=research_root / "v5" / "studies",
+        protocol_path=Path(asset_root) / "research_protocol_v5_exploratory.json",
+        time_audit_path=research_root / "jesse" / "time-in-market-metric-audit.json")
+    forward_cohort = ForwardCohort(forward_path)
+    handler = handler_for(lab, research_jobs, forward_cohort, historical_v5,
+        desktop_token=desktop_token, static_root=asset_root, read_only_desktop=read_only_desktop)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    except BaseException:
+        lab.stop.set()
+        research_jobs.stop()
+        forward_cohort.stop()
+        raise
+    # HTTP handlers are not allowed to keep a native window alive during
+    # shutdown. Mutating controls are serialized/rejected by _control_lock;
+    # read-only requests are bounded and their daemon threads die with the
+    # owned process. The legacy CLI below keeps its own daemon policy.
+    server.daemon_threads = True
+    server.block_on_close = False
+    server._control_lock = threading.RLock()
+    server._closing = False
+    return OwnedServer(server, lab, research_jobs, forward_cohort)
+
+
+class OwnedServer:
+    """Lifecycle wrapper for exactly one server and the workers it created."""
+    def __init__(self, server, lab, research_jobs, forward_cohort):
+        self.server, self.lab, self.research_jobs, self.forward_cohort = server, lab, research_jobs, forward_cohort
+        self.thread = None
+        self._started = False
+        self._stopped = False
+        self._lifecycle_lock = threading.Lock()
+
+    @property
+    def address(self):
+        return self.server.server_address
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.address[1]}"
+
+    def start(self):
+        with self._lifecycle_lock:
+            if self._stopped:
+                raise RuntimeError("Owned server has already stopped.")
+            if self._started:
+                raise RuntimeError("Owned server is already running.")
+            self.thread = threading.Thread(target=self.server.serve_forever,
+                kwargs={"poll_interval": .2}, name="rko-desktop-http", daemon=True)
+            self.thread.start()
+            self._started = True
+        shutdown_event = getattr(self.server, "_BaseServer__is_shut_down", None)
+        if shutdown_event is not None:
+            deadline = time.monotonic() + 2
+            while shutdown_event.is_set() and time.monotonic() < deadline and self.thread.is_alive():
+                time.sleep(.005)
+            if shutdown_event.is_set():
+                self.stop()
+                raise RuntimeError("Owned HTTP server did not enter its serve loop.")
+
+    def stop(self):
+        with self._lifecycle_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+        # Serialize with any control that already began. Later mutations see
+        # _closing and are rejected before reaching the paper engines.
+        with self.server._control_lock:
+            self.server._closing = True
+        self.lab.stop.set()
+        if self.forward_cohort is not None:
+            self.forward_cohort.stop()
+        self.research_jobs.stop()
+        if self._started and self.thread and self.thread.is_alive():
+            self.server.shutdown()
+        self.server.server_close()
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(timeout=3)
 
 
 def main():

@@ -452,3 +452,5 @@ dialog form{position:sticky;bottom:-24px;padding:10px 0 0;background:var(--panel
   .v4-result-controls label{width:100%;flex:1 1 auto}
   #v4-result-provenance{width:100%}
 }
+[hidden].desktop-diagnostic-banner { display:none; }
+.desktop-diagnostic-banner { position:sticky; top:0; z-index:6; padding:10px 18px; color:#183c38; background:#dbe9e5; border-bottom:1px solid #a9c5bd; font-size:14px; font-weight:700; letter-spacing:.03em; }

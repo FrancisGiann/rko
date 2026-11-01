@@ -1,6 +1,35 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const params = new URLSearchParams(location.search);
+const desktopMode = params.get('desktop') === '1';
+const diagnosticMode = desktopMode && params.get('diagnostic') === '1';
+const CSV_FILE_NAME = /^SIMULATED-[A-Za-z0-9_-]{1,80}\.csv$/;
+let desktopTokenWaiter = null;
+function desktopToken() {
+  if (!desktopMode) return Promise.resolve(null);
+  if (typeof window.pywebview?.token === 'string' && window.pywebview.token.length >= 16) return Promise.resolve(window.pywebview.token);
+  if (!desktopTokenWaiter) desktopTokenWaiter = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Desktop authorization is not ready; reload the app.')), 10000);
+    window.addEventListener('pywebviewready', () => {
+      clearTimeout(timer);
+      const value = window.pywebview?.token;
+      if (typeof value === 'string' && value.length >= 16) resolve(value);
+      else reject(new Error('Desktop authorization is unavailable; private requests are blocked.'));
+    }, {once:true});
+  });
+  return desktopTokenWaiter;
+}
+async function apiFetch(url, options = {}) {
+  const target = new URL(url, location.href);
+  if (target.origin !== location.origin || !target.pathname.startsWith('/api/')) throw new Error('Private data requests are limited to this local app.');
+  if (!desktopMode) return fetch(url, options);
+  const token = await desktopToken();
+  const headers = new Headers(options.headers || {});
+  headers.set('X-RKO-Desktop-Token', token);
+  const response = await fetch(target.href, {...options, headers, credentials:'omit', referrerPolicy:'no-referrer', redirect:'error'});
+  if (response.redirected || new URL(response.url).origin !== location.origin) throw new Error('Private API redirected outside the local app.');
+  return response;
+}
 let mode = params.get('mode') === 'demo' ? 'demo' : 'live';
 let symbol = ['BTC-USD', 'ETH-USD'].includes(params.get('symbol')) ? params.get('symbol') : 'BTC-USD';
 let current = null, request = null, generation = 0, busy = false, toastTimer, curve = [], v4state = null,
@@ -44,7 +73,7 @@ async function load(showLoading = false) {
   request?.abort(); request = new AbortController();
   if (showLoading) loading();
   try {
-    const response = await fetch(`/api/state?mode=${mode}&symbol=${symbol}`, {signal:request.signal});
+    const response = await apiFetch(`/api/state?mode=${mode}&symbol=${symbol}`, {signal:request.signal});
     const state = await response.json();
     if (!response.ok) throw new Error(state.error || 'Local data could not be loaded.');
     if (stamp !== generation) return;
@@ -145,7 +174,7 @@ const v4hash = value => value ? `${value.slice(0,12)}â€¦${value.slice(-8)}` : 'â
 function v4empty(body, cols, message) { const row=document.createElement('tr'), td=cell(row,message,'empty-cell'); td.colSpan=cols; body.replaceChildren(row); }
 async function loadV4() {
   try {
-    const response = await fetch('/api/research/v4'); const state = await response.json();
+    const response = await apiFetch('/api/research/v4'); const state = await response.json();
     if (!response.ok) throw new Error(state.error || 'Historical research status is unavailable.');
     v4state = state; renderV4(state);
   } catch (error) {
@@ -288,7 +317,7 @@ function renderV4Diagnostics(study,fold) {
 async function startV4(actionName) {
   $('v4-fetch').disabled=true;$('v4-evaluate').disabled=true;
   try {
-    const response=await fetch('/api/research/v4',{method:'POST',headers:{'Content-Type':'application/json','X-Crypto-Lab':'1'},body:JSON.stringify({action:actionName})});
+    const response=await apiFetch('/api/research/v4',{method:'POST',headers:{'Content-Type':'application/json','X-Crypto-Lab':'1'},body:JSON.stringify({action:actionName})});
     const result=await response.json();if(!response.ok)throw new Error(result.error||'V4 research job could not start.');
     toast(actionName==='fetch'?'Official archive fetch started.':'Frozen evaluation started.');await loadV4();
   } catch(error) {toast(error.message,true);await loadV4();}
@@ -307,7 +336,7 @@ const v5num = (value, digits=2) => value == null || !Number.isFinite(value) ? 'â
 const v5money = value => value == null || !Number.isFinite(value) ? 'â€”' : value.toFixed(2) + ' USDT';
 async function loadV5() {
   try {
-    const response=await fetch('/api/research/v5',{cache:'no-store'});
+    const response=await apiFetch('/api/research/v5',{cache:'no-store'});
     const state=await response.json();
     if(!response.ok)throw new Error(state.message||'Saved V5 summary is unavailable.');
     v5state=state;renderV5(state);
@@ -446,7 +475,7 @@ function renderProtectionSummary(state) {
 }
 async function loadForward() {
   try {
-    const response=await fetch('/api/forward/v5',{cache:'no-store'}),state=await response.json();
+    const response=await apiFetch('/api/forward/v5',{cache:'no-store'}),state=await response.json();
     if(!response.ok)throw new Error(state.error||'Forward cohort status unavailable.');
     forwardLoaded=true;forwardState=state;forwardClockAnchor={epoch:Number(state.server_now_epoch),performanceAt:performance.now()};$('forward-retry').hidden=true;renderForward(state);
   } catch(error) {
@@ -573,7 +602,7 @@ async function forwardAction(actionName,confirmValue,extra={}) {
   if(forwardBusy)return;
   forwardBusy=true;
   try {
-    const response=await fetch('/api/forward/v5',{method:'POST',headers:{'Content-Type':'application/json','X-Crypto-Lab':'1'},body:JSON.stringify({action:actionName,confirm:confirmValue,...extra})});
+    const response=await apiFetch('/api/forward/v5',{method:'POST',headers:{'Content-Type':'application/json','X-Crypto-Lab':'1'},body:JSON.stringify({action:actionName,confirm:confirmValue,...extra})});
     const result=await response.json();
     if(!response.ok)throw new Error(result.error||'Forward cohort action failed.');
     const messages={start:'Session started. The timer includes warmup; daily signals keep their existing schedule.',resume:'Session resumed with the same deadline and a new observation baseline.',pause:'Paused. Positions remain held and the original deadline continues.',stop:'The entry window is closed; the selected expiry policy now applies.',exit:'Close requested. Entries are disabled; the cohort finishes after all open positions close from fresh quotes.',reset:'Prior cohort archived; a new session can be reviewed.'};
@@ -657,7 +686,7 @@ async function action(name, confirm) {
   if (busy) return;
   busy = true; if (current) render(current);
   try {
-    const response = await fetch('/api/control', {method:'POST',headers:{'Content-Type':'application/json','X-Crypto-Lab':'1'},body:JSON.stringify({mode,symbol,action:name,confirm})});
+    const response = await apiFetch('/api/control', {method:'POST',headers:{'Content-Type':'application/json','X-Crypto-Lab':'1'},body:JSON.stringify({mode,symbol,action:name,confirm})});
     const result = await response.json(); if (!response.ok) throw new Error(result.error || 'Action failed.');
     toast(result.message); await load();
   } catch (error) { toast(error.message,true); }
@@ -671,7 +700,72 @@ $('start').addEventListener('click', () => action(mode==='demo'?'replay':current
 $('pause').addEventListener('click', () => action('pause'));
 $('reset').addEventListener('click', () => {text('reset-title', `Reset ${symbol.split('-')[0]} ${mode === 'demo' ? 'synthetic replay' : 'paper account'}?`);$('reset-dialog').showModal();});
 $('reset-dialog').addEventListener('close', () => {if($('reset-dialog').returnValue==='reset') action('reset','RESET');});
+function syncSectionNavigation() {
+  const links = [...document.querySelectorAll('nav[aria-label="Sections"] a[href^="#"]')];
+  const target = location.hash.slice(1) || (desktopMode ? 'forward-cohort' : 'v5-history');
+  for (const link of links) {
+    const active = link.hash.slice(1) === target;
+    link.classList.toggle('nav-active', active);
+    if (active) link.setAttribute('aria-current','location');
+    else link.removeAttribute('aria-current');
+  }
+}
+if (desktopMode) {
+  $('skip-link')?.setAttribute('href','#forward-cohort');
+  if ($('skip-link')) $('skip-link').textContent='Skip to forward paper session';
+  if (!location.hash) history.replaceState(null,'',`${location.pathname}${location.search}#forward-cohort`);
+}
+syncSectionNavigation();
+addEventListener('hashchange',syncSectionNavigation);
+if (diagnosticMode) {
+  $('desktop-diagnostic-banner').hidden=false;
+  for(const control of document.querySelectorAll('button,input[type="submit"]'))control.disabled=true;
+  window.__rkoDesktopProbe = async () => {
+    const token = await desktopToken();
+    const deadline=Date.now()+10000;
+    while(!forwardLoaded && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,50));
+    if(!forwardLoaded || !forwardState) throw new Error('Forward panel did not reach an authenticated ready state.');
+    const results = {};
+    const paths = ['/api/health','/api/state?mode=demo&symbol=BTC-USD','/api/research/v4','/api/research/v5','/api/forward/v5','/api/export.csv?mode=demo&symbol=BTC-USD','/api/forward/v5/export.csv'];
+    for (const path of paths) {
+      const denied = await fetch(path,{credentials:'omit',referrerPolicy:'no-referrer'});
+      const allowed = await fetch(path,{headers:{'X-RKO-Desktop-Token':token},credentials:'omit',referrerPolicy:'no-referrer'});
+      results[path] = {unauthorized_status:denied.status,authorized_status:allowed.status,content_type:allowed.headers.get('content-type')};
+    }
+    const postHeaders={'X-Crypto-Lab':'1','Content-Type':'application/json'};
+    const deniedPost=await fetch('/api/control',{method:'POST',headers:postHeaders,body:JSON.stringify({mode:'demo',symbol:'BTC-USD',action:'invalid'})});
+    const allowedPost=await fetch('/api/control',{method:'POST',headers:{...postHeaders,'X-RKO-Desktop-Token':token},body:JSON.stringify({mode:'demo',symbol:'BTC-USD',action:'invalid'})});
+    results.post_control = {unauthorized_status:deniedPost.status,authorized_status:allowedPost.status};
+    return {title:document.title,hash:location.hash,width:innerWidth,height:innerHeight,active_nav:document.querySelector('nav .nav-active')?.getAttribute('aria-current')||null,forward_ready:forwardLoaded,url_has_token:location.href.includes(token),results};
+  };
+}
 selectContext(); load(true); loadV5(); loadForward(); loadV4();
+async function downloadPrivateCsv(event, anchor, href, fallbackName) {
+  if (!desktopMode) return;
+  event.preventDefault();
+  try {
+    const response=await apiFetch(href);
+    if(!response.ok)throw new Error(`Export failed (${response.status}).`);
+    const disposition=response.headers.get('content-disposition')||'';
+    const filename=/filename="([A-Za-z0-9._-]+)"/i.exec(disposition)?.[1]||fallbackName;
+    const csv=await response.text();
+    if(!CSV_FILE_NAME.test(filename))throw new Error('Export filename was rejected.');
+    const saved=await window.pywebview.api.save_csv(filename,csv);
+    toast(saved?'CSV saved using the system file dialog.':'CSV save was canceled.');
+  } catch(error) { toast(error.message,true); }
+}
+$('export').addEventListener('click',event=>downloadPrivateCsv(event,$('export'),$('export').href,`SIMULATED-${mode}-${symbol}.csv`));
+$('forward-export').addEventListener('click',event=>downloadPrivateCsv(event,$('forward-export'),$('forward-export').href,'SIMULATED-forward-v5.csv'));
+document.addEventListener('click', async event=>{
+  if(!desktopMode)return;
+  const link=event.target.closest('a[href]');
+  if(!link)return;
+  const url=new URL(link.href,location.href);
+  if(url.origin===location.origin || !['https:'].includes(url.protocol))return;
+  event.preventDefault();
+  try { await desktopToken(); await window.pywebview.api.open_external(url.href); }
+  catch { toast('External link could not be opened safely.',true); }
+});
 addEventListener('resize',()=>{if(curve.length)drawChart(curve);});
 setInterval(() => { if (!document.hidden && !busy && !$('reset-dialog').open) load(); },10000);
 setInterval(() => { if (!document.hidden) loadV4(); },5000);
