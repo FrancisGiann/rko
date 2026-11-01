@@ -1,0 +1,176 @@
+name: Windows desktop validation (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1; Node 24 runtime
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12 x64
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0; Node 24 runtime
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Install pinned build requirements
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --requirement requirements-windows.txt
+          if ($LASTEXITCODE -ne 0) { throw "Pinned dependency installation failed ($LASTEXITCODE)." }
+
+      - name: Run source regression suite
+        shell: pwsh
+        run: |
+          python -m unittest discover -v
+          if ($LASTEXITCODE -ne 0) { throw "Python regression suite failed ($LASTEXITCODE)." }
+          node --check app.js
+          if ($LASTEXITCODE -ne 0) { throw "JavaScript syntax check failed ($LASTEXITCODE)." }
+          node test_time_utils.js
+          if ($LASTEXITCODE -ne 0) { throw "JavaScript utility checks failed ($LASTEXITCODE)." }
+
+      - name: Build unsigned one-directory package
+        shell: pwsh
+        run: |
+          $bundle = Join-Path $env:RUNNER_TEMP "RKO"
+          $manifest = Join-Path $env:RUNNER_TEMP "rko-build-manifest.json"
+          python tools/build_windows.py --out $bundle --receipt $manifest
+          if ($LASTEXITCODE -ne 0) { throw "Windows package build failed ($LASTEXITCODE)." }
+
+      - name: Check WebView2 Runtime and run offline native diagnostic
+        shell: pwsh
+        run: |
+          $rawReport = Join-Path $env:RUNNER_TEMP "rko-diagnostic-raw.json"
+          $runtimeGuid = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+          $registryPaths = @(
+            "HKCU:\Software\Microsoft\EdgeUpdate\Clients\$runtimeGuid",
+            "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$runtimeGuid",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$runtimeGuid"
+          )
+          $runtimeVersion = $null
+          foreach ($registryPath in $registryPaths) {
+            try {
+              $rawVersion = (Get-ItemProperty -LiteralPath $registryPath -Name pv -ErrorAction Stop).pv
+              $parsedVersion = [version]::MinValue
+              if ($rawVersion -and [version]::TryParse([string]$rawVersion, [ref]$parsedVersion) -and
+                  $parsedVersion -gt [version]"0.0.0.0") {
+                $runtimeVersion = $parsedVersion.ToString()
+                break
+              }
+            } catch { }
+          }
+          if (-not $runtimeVersion) {
+            @{ schema = "rko-windows-validation-v1"; passed = $false; gui_ready = $false;
+               runtime_present = $false; provider_attempts = 0; reason = "Microsoft Edge WebView2 Runtime is not installed on this runner." } |
+              ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $rawReport
+            throw "WebView2 Runtime is required. RKO does not download or install it. See https://developer.microsoft.com/microsoft-edge/webview2/"
+          }
+
+          $bundleExe = Join-Path $env:RUNNER_TEMP "RKO\RKO.exe"
+          $dataDir = Join-Path $env:RUNNER_TEMP "rko-offline-diagnostic-data"
+          $process = Start-Process -FilePath $bundleExe -ArgumentList @(
+            "--diagnostic", "--data-dir", $dataDir,
+            "--diagnostic-timeout-seconds", "45", "--diagnostic-report", $rawReport
+          ) -PassThru
+          if (-not $process.WaitForExit(60000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            @{ schema = "rko-windows-validation-v1"; passed = $false; gui_ready = $false;
+               runtime_present = $true; provider_attempts = 0; reason = "The diagnostic process exceeded its 60-second CI bound." } |
+              ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $rawReport
+            throw "Offline native diagnostic exceeded its 60-second bound."
+          }
+          if ($process.ExitCode -ne 0) {
+            throw "Offline native diagnostic failed ($($process.ExitCode))."
+          }
+          if (-not (Test-Path -LiteralPath $rawReport -PathType Leaf)) {
+            throw "Offline native diagnostic exited without a report."
+          }
+          $report = Get-Content -LiteralPath $rawReport -Raw | ConvertFrom-Json
+          if (-not $report.passed -or -not $report.gui_ready -or
+              $report.provider_attempts -ne 0 -or
+              $report.forward_state.session_status -ne "not_started" -or
+              $report.forward_state.totals.all_forward_fills -ne 0) {
+            throw "Offline diagnostic did not prove a ready, stopped, zero-fill, zero-provider state."
+          }
+          @{ schema = "rko-windows-validation-v1"; passed = $true; gui_ready = $true;
+             runtime_present = $true; runtime_version = $runtimeVersion;
+             provider_attempts = 0; session_status = "not_started"; all_forward_fills = 0;
+             process_exit_code = $process.ExitCode } |
+            ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $rawReport
+
+      - name: Create redacted validation receipt
+        if: always()
+        shell: pwsh
+        run: |
+          $rawReport = Join-Path $env:RUNNER_TEMP "rko-diagnostic-raw.json"
+          $safeReport = Join-Path $env:RUNNER_TEMP "rko-windows-validation.json"
+          $raw = $null
+          if (Test-Path -LiteralPath $rawReport -PathType Leaf) {
+            try { $raw = Get-Content -LiteralPath $rawReport -Raw | ConvertFrom-Json } catch { $raw = $null }
+          }
+          if ($null -eq $raw) {
+            $raw = @{ passed = $false; gui_ready = $false; runtime_present = $false;
+                      provider_attempts = 0; reason = "No valid diagnostic report was produced." }
+          }
+          $passed = ($raw.schema -eq "rko-windows-validation-v1" -and
+                     $raw.passed -eq $true -and $raw.gui_ready -eq $true -and
+                     $raw.runtime_present -eq $true -and $raw.provider_attempts -eq 0 -and
+                     $raw.session_status -eq "not_started" -and $raw.all_forward_fills -eq 0)
+          $safe = [ordered]@{
+            schema = "rko-windows-validation-v1"
+            passed = $passed
+            gui_ready = [bool]$raw.gui_ready
+            runtime_present = [bool]$raw.runtime_present
+            runtime_version = $raw.runtime_version
+            provider_attempts = if ($null -ne $raw.provider_attempts) { [int]$raw.provider_attempts } else { 0 }
+            session_status = $raw.session_status
+            all_forward_fills = $raw.all_forward_fills
+            reason = if ($passed) { $null } elseif ($raw.reason) { [string]$raw.reason } else { "The Windows native diagnostic did not meet every required check." }
+          }
+          $safe | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $safeReport
+
+          $inputManifest = Join-Path $env:RUNNER_TEMP "rko-build-manifest.json"
+          $safeManifest = Join-Path $env:RUNNER_TEMP "rko-windows-build-manifest.json"
+          if (Test-Path -LiteralPath $inputManifest -PathType Leaf) {
+            $manifest = Get-Content -LiteralPath $inputManifest -Raw | ConvertFrom-Json
+            $safeBuild = [ordered]@{
+              schema = $manifest.schema
+              build_id = $manifest.build_id
+              target = $manifest.target
+              python = $manifest.python
+              source_sha256 = $manifest.source_sha256
+              policy_sha256 = $manifest.policy_sha256
+              package_sha256 = $manifest.package_sha256
+              qt_included = $manifest.qt_included
+              market_data_bundled = $manifest.market_data_bundled
+              saved_studies_bundled = $manifest.saved_studies_bundled
+              pyinstaller_version = $manifest.pyinstaller_version
+              pywebview_version = $manifest.pywebview_version
+            }
+            $safeBuild | ConvertTo-Json -Depth 10 | Set-Content -Encoding utf8 $safeManifest
+          } else {
+            @{ schema = "rko-windows-build-manifest-v1"; build_receipt_present = $false } |
+              ConvertTo-Json -Depth 3 | Set-Content -Encoding utf8 $safeManifest
+          }
+
+      - name: Retain redacted report and manifest only
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2; Node 24 runtime
+        with:
+          name: rko-windows-validation-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}\rko-windows-validation.json
+            ${{ runner.temp }}\rko-windows-build-manifest.json
+          if-no-files-found: error
+          retention-days: 7
