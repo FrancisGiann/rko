@@ -12,6 +12,10 @@ const date = (ts, short = false) => ts == null ? '—' : new Intl.DateTimeFormat
 const text = (id, value) => { $(id).textContent = value; };
 function signed(id, value, percent = true) { text(id, percent ? pct(value, true) : usd(value)); $(id).classList.toggle('positive', value > 0); $(id).classList.toggle('negative', value < 0); }
 function toast(message, error = false) { text('toast', message); $('toast').classList.toggle('error', error); $('toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').hidden = true, 7500); }
+function clearErrorToast() {
+  if(!$('toast').classList.contains('error'))return;
+  clearTimeout(toastTimer);$('toast').hidden=true;$('toast').classList.remove('error');
+}
 function cell(row, value, cls) { const el = document.createElement('td'); el.textContent = value; if (cls) el.className = cls; row.append(el); return el; }
 function emptyRow(body, count, message) { const row = document.createElement('tr'); const td = cell(row, message, 'empty-cell'); td.colSpan = count; body.replaceChildren(row); }
 function selectContext() {
@@ -396,8 +400,7 @@ $('v5-refresh').addEventListener('click',loadV5);
 for(const id of ['v5-symbol','v5-fold','v5-cost'])$(id).addEventListener('change',()=>{if(v5state)renderV5(v5state);});
 $('v5-pair-details').addEventListener('toggle',()=>{if($('v5-pair-details').open&&v5state)renderV5Pairs(v5state);});
 function fmtUtc(value) {
-  if(!value)return '—';
-  return new Date(value).toISOString().replace('T',' ').replace('.000Z',' UTC').replace('Z',' UTC');
+  return RkoTime.formatUtc(value);
 }
 function serverEpochNow() {
   if(!forwardClockAnchor)return null;
@@ -418,6 +421,29 @@ function selectedSessionMinutes() {
   if(!/^\d+$/.test(raw)||!Number.isInteger(minutes)||minutes<1||minutes>259200)throw new Error('Custom duration must be a whole number from 1 to 259200 minutes.');
   return minutes;
 }
+function selectedProtectionPct(id,name,maximum) {
+  const raw=$(id).value.trim();
+  if(!raw)return null;
+  if(!/^\d+(?:\.\d)?$/.test(raw))throw new Error(`${name} must be OFF or a number from 0.1 to ${maximum} in 0.1-point steps.`);
+  const value=Number(raw),tenths=value*10;
+  if(!Number.isFinite(value)||value<0.1||value>maximum||Math.abs(tenths-Math.round(tenths))>1e-9)
+    throw new Error(`${name} must be OFF or a number from 0.1 to ${maximum} in 0.1-point steps.`);
+  return value;
+}
+function protectionPct(value) {return value==null?'OFF':Number(value).toFixed(1)+'%';}
+function renderProtectionSummary(state) {
+  if(state.protection_legacy_frozen) {
+    text('forward-protection-summary','Legacy position settings are preserved. V5.2 TP/SL was not applied retroactively; use a fresh-quote close or archive/reset after positions are flat.');
+    return;
+  }
+  const protection=state.session_config?.position_protection;
+  if(protection) {
+    text('forward-protection-summary',`Session TP ${protectionPct(protection.take_profit_pct)} · SL ${protectionPct(protection.stop_loss_pct)}. Frozen for this session; each new position keeps its own immutable snapshot.`);
+    return;
+  }
+  const tp=$('forward-take-profit')?.value||'',sl=$('forward-stop-loss')?.value||'';
+  text('forward-protection-summary',`Position TP/SL: ${tp?Number(tp).toFixed(1)+'%':'OFF'} / ${sl?Number(sl).toFixed(1)+'%':'OFF'} · chosen values are frozen only after explicit Start confirmation.`);
+}
 async function loadForward() {
   try {
     const response=await fetch('/api/forward/v5',{cache:'no-store'}),state=await response.json();
@@ -437,9 +463,17 @@ function renderForward(state) {
   const status=state.state||'unavailable',session=state.session_status||'legacy_untimed';
   const labels={not_started:'NOT STARTED · 0 FORWARD DAYS',active:status==='starting'?'SESSION ACTIVE · BASELINE LOADING':'SESSION ACTIVE',paused:'SESSION PAUSED · TIMER CONTINUES',expired_pending_close:'EXPIRED · PENDING CLOSE',stopped_pending_close:'STOPPED · PENDING CLOSE',expired_exit_only:'EXPIRED · EXIT-ONLY',stopped_exit_only:'STOPPED · EXIT-ONLY',finished:'SESSION FINISHED',legacy_untimed:'UNTIMED V5 COHORT · ENTRIES DISABLED',clock_suspect:'CLOCK CHECK FAILED · ENTRIES DISABLED'};
   text('forward-state',labels[session]||session.toUpperCase().replace(/_/g,' '));
+  const qaFixture=!!state.qa_fixture;
+  $('forward-qa-fixture').hidden=!qaFixture;
+  text('forward-qa-fixture','SYNTHETIC QA FIXTURE — seeded quotes, positions and fills only; no public feed or market evidence.');
+  for(const id of ['forward-qa-fixture-accounts','forward-qa-fixture-episodes','forward-qa-fixture-ledger']) {
+    $(id).hidden=!qaFixture;
+    text(id,'SYNTHETIC QA FIXTURE — fabricated values for interface checks; no market evidence.');
+  }
   const defaultReason=state.reason||'No research job is running.';
   text('forward-message',state.error||defaultReason);
   text('forward-timing','Baseline '+(state.baseline_utc?.['BTC-USD']||'not set')+' · last paired point '+(state.last_daily_observation_utc?.['BTC-USD']||'not set')+' · next observation '+(state.next_eligible_observation_utc||'after confirmed start')+' · scheduled fill '+(state.next_due_utc||'—')+' · daily entry expiry '+(state.next_expiry_utc||'—'));
+  renderProtectionSummary(state);
   const serverNow=serverEpochNow()??Number(state.server_now_epoch||0),deadline=Number(state.session_deadline_epoch||0),terminal=['expired_pending_close','stopped_pending_close','expired_exit_only','stopped_exit_only','finished','legacy_untimed','clock_suspect'].includes(session);
   text('forward-accepted',state.session_started_at_utc?fmtUtc(state.session_started_at_utc):'—');
   if(deadline){text('forward-deadline',state.session_deadline_utc||'—');const remaining=deadline-(serverNow||0);text('forward-countdown',terminal?(session.includes('pending_close')?'Awaiting fresh close':session.includes('exit_only')?'Exit-only · no new entries':session==='finished'?'Finished':'Entries disabled'):remaining<=0?'Deadline reached · checking server':timerDuration(remaining));}
@@ -448,9 +482,12 @@ function renderForward(state) {
   if(!Number.isFinite(nextWindow))nextWindow=nextDailyFillEpoch(serverNow);
   text('forward-next-window',fmtUtc(new Date(nextWindow*1000).toISOString()));
   const actualDays=Number(state.forward_days||0),performance=!!state.is_performance_observation;
-  text('forward-disclaimer',performance
-    ? actualDays + ' post-start paired daily observation day(s) · ' + (state.totals?.post_start_marks||0) + ' sampled marks · ' + (state.totals?.all_forward_fills||0) + ' simulated fills. USD aggregate sampled-price results only; not venue execution evidence.'
-    : 'Not started or no subsequent performance observation · ' + actualDays + ' forward days · starting cash is not a result. Warmup history is input-only.');
+  const operatingLimit='Fresh paired quote checks run about every five minutes only while the local service is running. Offline, stale, delayed or gapped data can miss a threshold or worsen a fill; no trigger price, fill or maximum loss is guaranteed.';
+  text('forward-disclaimer',qaFixture
+    ? 'Synthetic QA fixture only. Every price, balance and fill shown here is fabricated for interface testing; this is not forward performance or market evidence. ' + operatingLimit
+    : (performance
+      ? actualDays + ' post-start paired daily observation day(s) · ' + (state.totals?.post_start_marks||0) + ' sampled marks · ' + (state.totals?.all_forward_fills||0) + ' simulated fills. USD aggregate sampled-price results only; not venue execution evidence.'
+      : 'Not started or no subsequent performance observation · ' + actualDays + ' forward days · starting cash is not a result. Warmup history is input-only.') + ' ' + operatingLimit);
   const starting=status==='starting',running=status==='running',paused=status==='paused';
   const canStart=session==='not_started'&&status==='not_started'&&!state.entry_disabled;
   $('forward-session-options').hidden=!canStart;
@@ -470,33 +507,65 @@ function renderForward(state) {
   $('forward-export').hidden=!state.cohort_id;
   const accountRows=[];
   const mobileRows=[];
-  if(!state.accounts?.length)emptyRow($('forward-account-body'),8,'Not started. No accounts exist and no performance is reported.');
+  if(!state.accounts?.length)emptyRow($('forward-account-body'),14,'Not started. No accounts exist and no performance is reported.');
   else for(const a of state.accounts) {
     const row=document.createElement('tr'),accountStatus=a.halted?'Risk halt':a.exit_requested?'Exit pending':session==='active'?'Active':session==='paused'?'Paused':labels[session]||status;
-    const fields=[['Asset',a.symbol],['Strategy',v5CandidateLabels[a.strategy]||a.strategy],['Account state',accountStatus],['Net liquidation',performance?usd(a.net_liquidation):'Not observed'],['Return',performance?v5pct(a.return_pct):'—'],['Drawdown',performance?v5pct(a.max_drawdown*100):'—'],['Exposure',performance?v5pct(a.asset_weight_pct):'—'],['Fees + slippage',performance?usd((a.fees||0)+(a.slippage||0)):'—']];
+    const priceText=value=>value==null?'—':usd(value);
+    const protectionText=Number(a.qty)>1e-12?`Current position TP ${protectionPct(a.position_tp_pct)} · SL ${protectionPct(a.position_sl_pct)} (frozen snapshot)`:'No open position · no position TP/SL snapshot';
+    const thresholds=`TP ${priceText(a.estimated_take_profit_price)} · SL ${priceText(a.estimated_stop_loss_price)}`;
+    const quoteAge=a.valuation_age_seconds==null?'—':Math.floor(a.valuation_age_seconds)+'s';
+    const quoteStamp=a.valuation_quote_utc?fmtUtc(a.valuation_quote_utc)+' · '+quoteAge+' age':'No accepted quote';
+    const fields=[['Asset',qaFixture?'SYNTHETIC QA FIXTURE · '+a.symbol:a.symbol],['Strategy',v5CandidateLabels[a.strategy]||a.strategy],['Account state',accountStatus],['Quantity',performance?Number(a.qty||0).toFixed(6):'Not observed'],['Remaining basis',performance?usd(a.basis||0):'Not observed'],['Net liquidation · est.',performance?usd(a.net_liquidation):'Not observed'],['Marked return',performance?v5pct(a.return_pct):'—'],['Net-liquidation return · est.',performance?v5pct(a.net_liquidation_return_pct):'—'],['Position net return · last quote',performance&&a.position_net_return_pct!=null?v5pct(a.position_net_return_pct):'—'],['TP / SL raw price estimates',a.qty>1e-12?thresholds:'—'],['Last quote · UTC / age',quoteStamp],['Drawdown',performance?v5pct(a.max_drawdown*100):'—'],['Exposure',performance?v5pct(a.asset_weight_pct):'—'],['Fees + slippage',performance?usd((a.fees||0)+(a.slippage||0)):'—']];
     fields.forEach(([label,value],index)=>{const td=cell(row,value);td.dataset.label=label;td.classList.add('forward-col-'+index);});
     accountRows.push(row);
     const card=document.createElement('article');card.className='forward-mobile-row';card.setAttribute('role','listitem');
-    const heading=document.createElement('h3');heading.textContent=a.symbol+' · '+(v5CandidateLabels[a.strategy]||a.strategy);card.append(heading);
-    const stateLine=document.createElement('p');stateLine.className='forward-account-state';stateLine.textContent=accountStatus;card.append(stateLine);
+    const heading=document.createElement('h3');heading.textContent=(qaFixture?'SYNTHETIC QA FIXTURE · ':'')+a.symbol+' · '+(v5CandidateLabels[a.strategy]||a.strategy);card.append(heading);
+    const stateLine=document.createElement('p');stateLine.className='forward-account-state';stateLine.textContent=accountStatus+' · '+a.protection_state;card.append(stateLine);
     const metrics=document.createElement('dl');metrics.className='forward-mobile-primary';
-    for(const [label,value,className] of [['Return',fields[4][1],a.return_pct>0?'positive':a.return_pct<0?'negative':''],['Drawdown',fields[5][1],''],['Exposure',fields[6][1],'']]){const div=document.createElement('div'),dtNode=document.createElement('dt'),ddNode=document.createElement('dd');dtNode.textContent=label;ddNode.textContent=value;if(className)ddNode.className=className;div.append(dtNode,ddNode);metrics.append(div);}
+    for(const [label,value,className] of [['Marked return',fields[6][1],a.return_pct>0?'positive':a.return_pct<0?'negative':''],['Drawdown',fields[11][1],''],['Exposure',fields[12][1],'']]){const div=document.createElement('div'),dtNode=document.createElement('dt'),ddNode=document.createElement('dd');dtNode.textContent=label;ddNode.textContent=value;if(className)ddNode.className=className;div.append(dtNode,ddNode);metrics.append(div);}
     card.append(metrics);
-    const details=document.createElement('details'),summary=document.createElement('summary');summary.textContent='Balance and modeled costs';details.append(summary);
+    const details=document.createElement('details'),summary=document.createElement('summary');summary.textContent='Position, protection, costs and episode history';details.append(summary);
     const extra=document.createElement('dl');extra.className='forward-mobile-extra';
-    for(const [label,value] of [fields[3],fields[7]]){const div=document.createElement('div'),dtNode=document.createElement('dt'),ddNode=document.createElement('dd');dtNode.textContent=label;ddNode.textContent=value;div.append(dtNode,ddNode);extra.append(div);}
+    const detailFields=[fields[3],fields[4],fields[5],fields[7],fields[8],['Protection status',a.protection_state],['Current position TP / SL',protectionText],['Estimated raw thresholds',a.qty>1e-12?thresholds:'—'],fields[10],['Fees',performance?usd(a.fees||0):'—'],['Slippage',performance?usd(a.slippage||0):'—'],['Realized P&L',performance?usd(a.realized_pnl||0):'—']];
+    for(const [label,value] of detailFields){const div=document.createElement('div'),dtNode=document.createElement('dt'),ddNode=document.createElement('dd');dtNode.textContent=label;ddNode.textContent=value;div.append(dtNode,ddNode);extra.append(div);}
     details.append(extra);card.append(details);mobileRows.push(card);
+    const histories=(state.position_episodes||[]).filter(ep=>ep.symbol===a.symbol&&ep.strategy===a.strategy);
+    if(histories.length){const history=document.createElement('ul');history.className='forward-episode-history';for(const ep of histories){const item=document.createElement('li'),closed=ep.status==='closed',protectiveClose=['take_profit','stop_loss'].includes(ep.close_reason);const trigger=ep.protection_trigger_reason?`${ep.protection_trigger_reason.replaceAll('_',' ')} decision ${ep.protection_triggered_at?fmtUtc(new Date(Number(ep.protection_triggered_at)*1000).toISOString()):'unavailable'} · quote ${priceText(ep.protection_trigger_price)} · net at decision ${ep.protection_trigger_return_pct==null?'—':v5pct(ep.protection_trigger_return_pct)} (trigger threshold ${ep.protection_trigger_threshold_pct==null?'—':protectionPct(ep.protection_trigger_threshold_pct)})`:protectiveClose?'Trigger evidence unavailable':'No TP/SL trigger';const opened=ep.opened_at?fmtUtc(new Date(Number(ep.opened_at)*1000).toISOString()):'time unavailable',closedAt=closed&&ep.closed_at?` · closed ${fmtUtc(new Date(Number(ep.closed_at)*1000).toISOString())}`:'';const finalClose=closed&&ep.close_reason?` · final close ${ep.close_reason.replaceAll('_',' ')}`:'';item.textContent=`${qaFixture?'SYNTHETIC QA FIXTURE · ':''}${closed?'Closed':'Open'} · opened ${opened}${closedAt} · position snapshot TP ${protectionPct(ep.take_profit_pct)} / SL ${protectionPct(ep.stop_loss_pct)} · net realized ${usd(ep.net_realized_pnl_usd||0)} · total entry cost ${usd(ep.total_entry_cost_usd||0)} · fees ${usd(ep.total_fees_usd||0)} · slippage ${usd(ep.total_slippage_usd||0)} · ${trigger}${finalClose}`;history.append(item);}const histTitle=document.createElement('p');histTitle.className='forward-history-title';histTitle.textContent=`Recent position episodes (${histories.length} shown; ${state.totals?.position_episodes||histories.length} total)`;details.append(histTitle,history);}
   }
   if(accountRows.length)$('forward-account-body').replaceChildren(...accountRows);
   if(mobileRows.length)$('forward-mobile-accounts').replaceChildren(...mobileRows);
   else {const empty=document.createElement('p');empty.className='forward-mobile-empty';empty.textContent='Not started. No accounts exist and no performance is reported.';$('forward-mobile-accounts').replaceChildren(empty);}
+  const episodes=state.position_episodes||[],episodeRows=episodes.map(ep=>{
+    const row=document.createElement('tr');
+    cell(row,(qaFixture?'SYNTHETIC QA FIXTURE · ':'')+ep.symbol+' · '+(v5CandidateLabels[ep.strategy]||ep.strategy));
+    cell(row,ep.opened_at?fmtUtc(new Date(Number(ep.opened_at)*1000).toISOString()):'—');
+    cell(row,ep.closed_at?fmtUtc(new Date(Number(ep.closed_at)*1000).toISOString()):'—');
+    cell(row,(ep.status||'—')+(ep.pending_reason?' · pending '+ep.pending_reason.replaceAll('_',' '):ep.status==='closed'&&ep.close_reason?' · closed '+ep.close_reason.replaceAll('_',' '):''));
+    cell(row,`TP ${protectionPct(ep.take_profit_pct)} · SL ${protectionPct(ep.stop_loss_pct)}`);
+    cell(row,usd(ep.total_entry_cost_usd||0));cell(row,usd(ep.remaining_basis||0));
+    cell(row,usd(ep.net_realized_pnl_usd||0),Number(ep.net_realized_pnl_usd)<0?'negative':Number(ep.net_realized_pnl_usd)>0?'positive':'');
+    cell(row,usd(ep.total_fees_usd||0));cell(row,usd(ep.total_slippage_usd||0));
+    const protectiveClose=['take_profit','stop_loss'].includes(ep.close_reason);const trigger=ep.protection_trigger_reason?`${ep.protection_trigger_reason.replaceAll('_',' ')} · decision ${ep.protection_triggered_at?fmtUtc(new Date(Number(ep.protection_triggered_at)*1000).toISOString()):'unavailable'} · quote ${ep.protection_trigger_price==null?'—':usd(ep.protection_trigger_price)} · net ${ep.protection_trigger_return_pct==null?'—':v5pct(ep.protection_trigger_return_pct)} of ${ep.protection_trigger_basis==null?'—':usd(ep.protection_trigger_basis)} at ${ep.protection_trigger_threshold_pct==null?'—':protectionPct(ep.protection_trigger_threshold_pct)}`:protectiveClose?'Trigger evidence unavailable':'—';cell(row,trigger);
+    return row;
+  });
+  if(episodeRows.length)$('forward-episode-body').replaceChildren(...episodeRows);else emptyRow($('forward-episode-body'),11,'No position episodes.');
+  const protectionRows=(state.protection_events||[]).map(event=>{
+    const row=document.createElement('tr');cell(row,(qaFixture?'SYNTHETIC QA FIXTURE · ':'')+event.symbol+' · '+(v5CandidateLabels[event.strategy]||event.strategy));cell(row,event.event_type||'—');
+    cell(row,(event.reason||'—').replaceAll('_',' ')+' · priority '+Number(event.priority||0));
+    cell(row,event.decided_at?fmtUtc(new Date(Number(event.decided_at)*1000).toISOString()):'—');
+    cell(row,event.price==null?'—':usd(event.price));
+    cell(row,event.net_return_pct==null?'—':v5pct(event.net_return_pct));cell(row,event.remaining_basis==null?'—':usd(event.remaining_basis));
+    cell(row,protectionPct(event.threshold_pct));cell(row,event.detail||'—');return row;
+  });
+  if(protectionRows.length)$('forward-protection-body').replaceChildren(...protectionRows);else emptyRow($('forward-protection-body'),9,'No TP/SL decisions.');
+  text('forward-protection-history-count',`${state.totals?.position_episodes||0} episodes · ${state.totals?.protection_events||0} protection events (${episodes.length} and ${protectionRows.length} recent rows shown)`);
   const decisions=state.decisions||[],fills=state.fills||[];
   text('forward-ledger-count',(decisions.length+fills.length) + ' recent records · full archived cohort export');
   const records=[
-    ...decisions.map(x=>({kind:'Decision',symbol:x.symbol,strategy:x.strategy,utc:x.created_at,status:x.status,target:x.target_weight,qty:null,reason:x.reason})),
-    ...fills.map(x=>({kind:'Fill',symbol:x.symbol,strategy:x.strategy,utc:x.receipt_at,status:x.side,target:null,qty:x.qty,reason:x.reason}))
-  ].sort((a,b)=>Date.parse(b.utc||'')-Date.parse(a.utc||'')).slice(0,60);
-  const ledgerRows=records.map(x=>{const row=document.createElement('tr');cell(row,x.kind);cell(row,x.symbol+' · '+(v5CandidateLabels[x.strategy]||x.strategy));cell(row,fmtUtc(x.utc));cell(row,x.status);cell(row,x.target==null?(x.qty==null?'—':x.qty.toFixed(6)):(x.target*100).toFixed(2)+'%');cell(row,x.reason);return row;});
+    ...decisions.map(x=>({kind:'Decision created',symbol:x.symbol,strategy:x.strategy,utc:x.created_at,status:x.status,target:x.target_weight,qty:null,reason:x.reason})),
+    ...fills.map(x=>({kind:x.applied_at!=null?'Fill applied':'Fill receipt (legacy)',symbol:x.symbol,strategy:x.strategy,utc:x.applied_at??x.receipt_at,status:x.side,target:null,qty:x.qty,reason:x.reason}))
+  ].sort((a,b)=>(RkoTime.epochMilliseconds(b.utc)??-Infinity)-(RkoTime.epochMilliseconds(a.utc)??-Infinity)).slice(0,60);
+  const ledgerRows=records.map(x=>{const row=document.createElement('tr');cell(row,(qaFixture?'SYNTHETIC QA FIXTURE · ':'')+x.kind);cell(row,x.symbol+' · '+(v5CandidateLabels[x.strategy]||x.strategy));cell(row,fmtUtc(x.utc));cell(row,x.status);cell(row,x.target==null?(x.qty==null?'—':x.qty.toFixed(6)):(x.target*100).toFixed(2)+'%');cell(row,x.reason);return row;});
   if(ledgerRows.length)$('forward-ledger-body').replaceChildren(...ledgerRows);else emptyRow($('forward-ledger-body'),6,'No forward decisions or fills have been recorded.');
   $('forward-state').classList.toggle('negative',!!state.error);
 }
@@ -516,16 +585,20 @@ function reviewForwardStart() {
   try {
     if(!forwardLoaded||!forwardState)throw new Error('A current local cohort status is required before reviewing a session. Retry the status check first.');
     const minutes=selectedSessionMinutes(),policy=$('forward-expiry-policy').value,now=serverEpochNow()??Date.now()/1000,deadline=now+minutes*60,next=nextDailyFillEpoch(now);
+    const takeProfit=selectedProtectionPct('forward-take-profit','Take profit',100),stopLoss=selectedProtectionPct('forward-stop-loss','Stop loss',99.9);
     const windowText=fmtUtc(new Date(next*1000).toISOString());
     const minuteLabel=n=>`${n} minute${n===1?'':'s'}`;
     text('forward-review-duration',minutes<60?minuteLabel(minutes):minutes%1440===0?`${minutes/1440} day${minutes/1440===1?'':'s'}`:minutes%60===0?`${minutes/60} hour${minutes/60===1?'':'s'}`:minuteLabel(minutes));
     text('forward-review-policy',policy==='CLOSE'?'Close holdings from a fresh quote after expiry.':'Exit-only after expiry; hold until signals or risk rules reduce positions.');
+    text('forward-review-protection',`Take profit ${protectionPct(takeProfit)} · stop loss ${protectionPct(stopLoss)}. Blank means OFF.`);
     text('forward-review-start',fmtUtc(new Date(now*1000).toISOString()));
     text('forward-review-deadline',fmtUtc(new Date(deadline*1000).toISOString()));
     text('forward-review-window',windowText);
     const warn=deadline<=next?'This session ends at or before the next scheduled 04:00 UTC fill window. Zero signals and zero trades are expected; the timer will not change signal cadence.':'A signal is still conditional on a later completed daily observation arriving before 04:00 UTC; this session may finish with zero trades.';
     text('forward-zero-signal-warning',warn);
     $('forward-start-dialog').dataset.durationMinutes=String(minutes);$('forward-start-dialog').dataset.expiryPolicy=policy;
+    $('forward-start-dialog').dataset.takeProfitPct=takeProfit==null?'':String(takeProfit);$('forward-start-dialog').dataset.stopLossPct=stopLoss==null?'':String(stopLoss);
+    clearErrorToast();
     $('forward-start-dialog').showModal();
   } catch(error) {toast(error.message,true);if($('forward-duration').value==='custom')$('forward-custom-minutes').focus();}
 }
@@ -533,9 +606,11 @@ $('forward-start').addEventListener('click',reviewForwardStart);
 $('forward-retry').addEventListener('click',loadForward);
 $('forward-confirm-start').addEventListener('click',event=>{
   event.preventDefault();const dialog=$('forward-start-dialog');const duration=Number(dialog.dataset.durationMinutes),policy=dialog.dataset.expiryPolicy;
-  dialog.close('confirmed');forwardAction('start','START',{duration_minutes:duration,expiry_policy:policy});
+  const takeProfit=dialog.dataset.takeProfitPct===''?null:Number(dialog.dataset.takeProfitPct),stopLoss=dialog.dataset.stopLossPct===''?null:Number(dialog.dataset.stopLossPct);
+  dialog.close('confirmed');forwardAction('start','START',{duration_minutes:duration,expiry_policy:policy,take_profit_pct:takeProfit,stop_loss_pct:stopLoss});
 });
 $('forward-duration').addEventListener('change',()=>{$('forward-custom-label').hidden=$('forward-duration').value!=='custom';});
+for(const id of ['forward-take-profit','forward-stop-loss'])$(id).addEventListener('input',()=>{if(forwardState)renderProtectionSummary(forwardState);});
 $('forward-pause').addEventListener('click',()=>forwardAction('pause'));
 $('forward-exit').addEventListener('click',()=>forwardAction('exit'));
 $('forward-stop').addEventListener('click',()=>forwardAction('stop'));

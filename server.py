@@ -24,7 +24,7 @@ def handler_for(lab: Lab, research_jobs: ResearchJobs | None = None,
     research_jobs = research_jobs or ResearchJobs()
     historical_v5 = historical_v5 or HistoricalV5Summary()
     class Handler(BaseHTTPRequestHandler):
-        server_version = "RKO/5.1"
+        server_version = "RKO/5.2"
 
         def allowed_host(self) -> bool:
             port = self.server.server_address[1]
@@ -75,7 +75,7 @@ def handler_for(lab: Lab, research_jobs: ResearchJobs | None = None,
                     if parsed.path == "/api/state":
                         return self.json(200, lab.state(mode, symbol))
                     return self.send_bytes(200, lab.export(mode, symbol).encode(), "text/csv; charset=utf-8", download=f"SIMULATED-{mode}-{symbol}.csv")
-                asset = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/styles.css": "styles.css", "/favicon.svg": "favicon.svg"}.get(parsed.path)
+                asset = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/time_utils.js": "time_utils.js", "/styles.css": "styles.css", "/favicon.svg": "favicon.svg"}.get(parsed.path)
                 if asset is None:
                     return self.json(404, {"error": "Not found."})
                 mime = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml"}[Path(asset).suffix]
@@ -115,7 +115,8 @@ def handler_for(lab: Lab, research_jobs: ResearchJobs | None = None,
                     if not isinstance(action, str):
                         raise ValueError("Forward action must be a string.")
                     state = forward_cohort.control(action, confirm=body.get("confirm"),
-                        duration_minutes=body.get("duration_minutes"), expiry_policy=body.get("expiry_policy"))
+                        duration_minutes=body.get("duration_minutes"), expiry_policy=body.get("expiry_policy"),
+                        take_profit_pct=body.get("take_profit_pct"), stop_loss_pct=body.get("stop_loss_pct"))
                     return self.json(202 if action in {"start", "resume"} else 200, {"ok": True, "state": state})
                 mode, symbol, action = body.get("mode"), body.get("symbol"), body.get("action")
                 if not all(isinstance(v, str) for v in (mode, symbol, action)):

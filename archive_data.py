@@ -56,14 +56,16 @@ def write_json(path: Path, value: object) -> None:
 
 def protocol() -> tuple[dict, str]:
     data = (ROOT / "research_protocol_v4.json").read_bytes()
-    digest = sha(data)
-    checksum = (ROOT / "research_protocol_v4.sha256").read_text().strip()
-    if digest != checksum:
+    receipt_path = ROOT / "research_protocol_v4.freeze.json"
+    if receipt_path.is_file():
+        expected_hash = json.loads(receipt_path.read_text())["sha256"]
+    else:
+        # The source-only distribution omits private selection/freeze receipts
+        # but retains the protocol's content checksum.
+        expected_hash = (ROOT / "research_protocol_v4.sha256").read_text().strip().split()[0]
+    if sha(data) != expected_hash:
         raise ValueError("Frozen research protocol hash differs; no download or evaluation permitted.")
-    recipe = json.loads(data)
-    if recipe.get("frozen_before_outcome_analysis") is not True:
-        raise ValueError("Research protocol is not marked frozen; no download or evaluation permitted.")
-    return recipe, digest
+    return json.loads(data), sha(data)
 
 
 def months(first: str = "2019-10", last: str = "2026-09") -> list[str]:
@@ -213,7 +215,56 @@ class ArchiveStore:
         return value
 
     def _migrate_pre_fit_manifest(self, manifest: dict) -> None:
-        raise ValueError("The public source bundle omits private pre-fit migration receipts; use a fresh checksum-verified dataset cache.")
+        prior_hash = manifest.get("protocol_sha256")
+        receipt_path = ROOT / "research_protocol_v4.freeze.json"
+        if not receipt_path.is_file():
+            raise ValueError("Pre-fit cache migration requires an amendment receipt not included in this source-only package.")
+        receipt = json.loads(receipt_path.read_text())
+        links = {item.get("prior_sha256"): item.get("new_sha256") for item in receipt.get("pre_fit_amendments", [])
+            if item.get("prior_sha256") and item.get("new_sha256")}
+        cursor, chain, seen = prior_hash, [], set()
+        while cursor != self.protocol_hash and cursor in links and cursor not in seen:
+            seen.add(cursor); next_hash = links[cursor]
+            chain.append({"prior_sha256": cursor, "new_sha256": next_hash})
+            cursor = next_hash
+        if cursor != self.protocol_hash or not chain:
+            raise ValueError("Cached dataset protocol change is not an approved pre-fit amendment chain.")
+        ledger = self.root / "trial-ledger.jsonl"
+        study_results = list((self.root / "studies").glob("v4-*.json")) if (self.root / "studies").exists() else []
+        if ledger.exists() and ledger.stat().st_size or study_results:
+            raise ValueError("Protocol migration is allowed only before any historical outcome study was recorded.")
+        verified = 0
+        for key, entry in manifest.get("archives", {}).items():
+            if entry.get("state") != "verified":
+                continue
+            try:
+                symbol, month = key.split("/", 1)
+                url, filename, _, _ = identity(symbol, month)
+                archive_path = self.root / "archives" / filename
+                checksum_path = archive_path.with_name(filename + ".CHECKSUM")
+                if archive_path.is_symlink() or checksum_path.is_symlink() or not archive_path.is_file() or not checksum_path.is_file():
+                    raise ValueError("verified archive/checksum pair is missing or symlinked")
+                data, checksum = archive_path.read_bytes(), checksum_path.read_bytes()
+                if sha(checksum) != entry.get("checksum_sha256"):
+                    raise ValueError("cached published checksum bytes differ from the verified manifest")
+                digest = verify_checksum(data, checksum, filename)
+                if digest != entry.get("archive_sha256"):
+                    raise ValueError("cached archive bytes differ from the verified manifest")
+                _, info = parse_archive(data, symbol, month)
+                entry.update(info)
+                entry["pre_fit_migrated_at_utc"] = iso()
+                verified += 1
+            except Exception as exc:
+                raise ValueError(f"Pre-fit manifest migration failed for {key}; cached bytes were preserved: {str(exc)[:250]}") from exc
+        manifest.update({"protocol_sha256": self.protocol_hash, "state": "partial", "datasets": {},
+            "completed": verified, "total": len(self.protocol["dataset"]["symbols"]) * len(months()),
+            "error": "Pre-fit clarification applied; archive hashes were revalidated. Resume fetch to complete normalized datasets.",
+            "pause_reason": None, "failed_archives": [key for key, value in manifest.get("archives", {}).items()
+                if value.get("state") != "verified"],
+            "protocol_migrations": manifest.get("protocol_migrations", []) + [{
+                "from_sha256": prior_hash, "to_sha256": self.protocol_hash, "approved_pre_fit_chain": chain,
+                "at_utc": iso(), "archives_revalidated": verified, "outcome_studies_present": False}]})
+        self.save_manifest(manifest)
 
     def save_manifest(self, manifest: dict):
         manifest["updated_at_utc"] = iso()

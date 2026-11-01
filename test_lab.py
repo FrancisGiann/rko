@@ -400,7 +400,7 @@ class ApiTests(unittest.TestCase):
         return self.request('/api/control','POST',json.dumps(body),h)
 
     def test_assets_health_and_real_api_state_both_symbols(self):
-        for path in ('/','/app.js','/styles.css','/favicon.svg','/api/health','/api/research/v4','/api/state?mode=demo&symbol=BTC-USD','/api/state?mode=demo&symbol=ETH-USD'):
+        for path in ('/','/app.js','/time_utils.js','/styles.css','/favicon.svg','/api/health','/api/research/v4','/api/state?mode=demo&symbol=BTC-USD','/api/state?mode=demo&symbol=ETH-USD'):
             code,headers,data=self.request(path); self.assertEqual(code,200,path); self.assertTrue(data); self.assertIn('Content-Security-Policy',headers)
 
     def test_legacy_public_get_is_cached_only_and_never_trains_or_fetches_history(self):

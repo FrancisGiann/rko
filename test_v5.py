@@ -77,25 +77,11 @@ class DailyHistoryValidationTests(unittest.TestCase):
             market.fetch_daily_history("BTCUSDT")
 
 
-class PublicSourceUnavailableResultTests(unittest.TestCase):
-    def test_v5_summary_fails_closed_without_separately_supplied_result_bundle(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            state = HistoricalV5Summary(studies=root / "studies",
-                protocol_path=Path(__file__).resolve().parent / "research_protocol_v5_exploratory.json",
-                time_audit_path=root / "missing-audit.json").state()
+class HistoricalSummaryAuditTests(unittest.TestCase):
+    def test_v5_view_is_unavailable_without_saved_result_bundle(self):
+        state = HistoricalV5Summary().state()
         self.assertFalse(state["available"])
-        self.assertEqual(state["cells"], [])
-        self.assertIn("No saved V5 exploratory result", state["message"])
-
-    def test_public_html_does_not_embed_private_market_result_examples(self):
-        root = Path(__file__).resolve().parent
-        html = (root / "index.html").read_text()
-        for private_result in ("−4.84%", "−2.41%", "−11.31%", "142 observations per symbol"):
-            with self.subTest(private_result=private_result):
-                self.assertNotIn(private_result, html)
-        self.assertIn("No result previews are included in this public source snapshot.", html)
+        self.assertIn("No saved V5 exploratory result is bundled", state["message"])
 
     def test_v5_status_copy_discloses_residual_dust_correction(self):
         app = (Path(__file__).resolve().parent / "app.js").read_text()

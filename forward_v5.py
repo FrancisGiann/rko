@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from decimal import Decimal, InvalidOperation
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -28,6 +29,61 @@ ENTRY_EXPIRY_SECONDS = 900
 MAX_QUOTE_AGE = 120
 FUTURE_TOLERANCE = 30
 SOURCE = "CoinGecko public aggregate USD prices"
+PROTECTION_SCHEMA = "v5.2-net-liquidation-remaining-basis"
+
+
+def validate_protection_threshold(value: object, *, name: str, maximum: float) -> float | None:
+    """Validate one optional percentage without accepting JSON booleans/strings."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be blank/OFF or a JSON number from 0.1 to {maximum:g} in 0.1-point increments.")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a finite number.") from exc
+    if not number.is_finite():
+        raise ValueError(f"{name} must be a finite number.")
+    if number < Decimal("0.1") or number > Decimal(str(maximum)):
+        raise ValueError(f"{name} must be from 0.1 to {maximum:g} percent.")
+    if (number * 10) != (number * 10).to_integral_value():
+        raise ValueError(f"{name} must use 0.1 percentage-point increments.")
+    return float(number)
+
+
+def net_position_return_pct(qty: float, basis: float, raw_price: float,
+                            fee_bps: float = FEE_BPS, slip_bps: float = SLIP_BPS) -> float | None:
+    """Mark the remaining long lot after estimated sell slippage and commission."""
+    values = (qty, basis, raw_price, fee_bps, slip_bps)
+    if not all(math.isfinite(float(x)) for x in values) or qty <= 0 or basis <= 0 or raw_price <= 0:
+        return None
+    sell_value = qty * raw_price * (1 - slip_bps / 10_000) * (1 - fee_bps / 10_000)
+    return (sell_value / basis - 1) * 100
+
+
+def estimated_protection_price(qty: float, basis: float, threshold_pct: float,
+                               *, take_profit: bool) -> float | None:
+    """Return the raw quote that reaches the selected net liquidation threshold."""
+    if not all(math.isfinite(float(x)) for x in (qty, basis, threshold_pct)) or qty <= 0 or basis <= 0:
+        return None
+    multiplier = 1 + threshold_pct / 100 if take_profit else 1 - threshold_pct / 100
+    if multiplier <= 0:
+        return None
+    sell_factor = (1 - SLIP_BPS / 10_000) * (1 - FEE_BPS / 10_000)
+    return basis * multiplier / (qty * sell_factor)
+
+
+def _reaches_protection_threshold(value: float, threshold: float, *, take_profit: bool) -> bool:
+    boundary = threshold if take_profit else -threshold
+    crossed = value >= boundary if take_profit else value <= boundary
+    # Binary floats may represent a quote derived from the exact threshold
+    # boundary a few ulps to the wrong side. This tolerance is 1e-10 percentage
+    # points; it cannot materially advance a trigger but makes equality inclusive.
+    return crossed or math.isclose(value, boundary, rel_tol=0.0, abs_tol=1e-10)
+
+
+EXIT_PRIORITY = {"take_profit": 20, "stop_loss": 21, "account_drawdown": 30,
+    "manual_close": 40, "session_close": 50}
 
 
 def utc_iso(ts: float | None) -> str | None:
@@ -134,6 +190,9 @@ class ForwardCohort:
         self._clock_anchor_mono = float(self._monotonic())
         self._last_wall_observed = self._clock_anchor_wall
         self.poll_seconds = poll_seconds
+        # Private QA launcher may set this to tag all locally fabricated
+        # prices/states; production server never sets the attribute.
+        self.qa_fixture_label = None
         self.lock = threading.RLock()
         self.worker_lock = threading.Lock()
         self.wake = threading.Event()
@@ -155,7 +214,7 @@ class ForwardCohort:
                   session_duration_minutes INTEGER, expiry_policy TEXT,
                   session_status TEXT NOT NULL DEFAULT 'not_started', entry_disabled INTEGER NOT NULL DEFAULT 0,
                   clock_high_water REAL, session_decided_at REAL, terminal_reason TEXT,
-                  close_retry_after REAL);
+                  close_retry_after REAL, session_config_json TEXT, protection_schema_version TEXT);
                 CREATE TABLE IF NOT EXISTS warmup_prices(
                   cohort_id TEXT NOT NULL, symbol TEXT NOT NULL, ts INTEGER NOT NULL,
                   price REAL NOT NULL, fetched_at REAL NOT NULL, warmup_only INTEGER NOT NULL CHECK(warmup_only=1),
@@ -172,7 +231,15 @@ class ForwardCohort:
                   signal_active INTEGER NOT NULL DEFAULT 0, last_price REAL, last_market_at REAL,
                   last_receipt_at REAL, fees REAL NOT NULL DEFAULT 0, slippage REAL NOT NULL DEFAULT 0,
                   realized_pnl REAL NOT NULL DEFAULT 0, max_drawdown REAL NOT NULL DEFAULT 0,
-                  updated_at REAL NOT NULL, PRIMARY KEY(cohort_id,symbol,strategy));
+                  updated_at REAL NOT NULL, episode_id TEXT, position_opened_at REAL,
+                  basis_updated_at REAL, basis_updated_receipt_at REAL, basis_updated_market_at REAL,
+                  position_tp_pct REAL, position_sl_pct REAL, cooldown_after_at REAL, cooldown_after_receipt_at REAL,
+                  exit_reason TEXT, exit_priority INTEGER NOT NULL DEFAULT 0,
+                  protection_trigger_reason TEXT, protection_triggered_at REAL,
+                  protection_trigger_price REAL, protection_trigger_market_at REAL,
+                  protection_trigger_return_pct REAL, protection_trigger_basis REAL,
+                  protection_trigger_threshold_pct REAL,
+                  PRIMARY KEY(cohort_id,symbol,strategy));
                 CREATE TABLE IF NOT EXISTS decisions(
                   id INTEGER PRIMARY KEY AUTOINCREMENT, cohort_id TEXT NOT NULL, symbol TEXT NOT NULL,
                   strategy TEXT NOT NULL, signal_ts INTEGER NOT NULL, created_at REAL NOT NULL,
@@ -185,7 +252,27 @@ class ForwardCohort:
                   receipt_at REAL NOT NULL, market_at REAL NOT NULL, side TEXT NOT NULL,
                   qty REAL NOT NULL, raw_price REAL NOT NULL, fill_price REAL NOT NULL,
                   fee REAL NOT NULL, slippage REAL NOT NULL, realized_pnl REAL NOT NULL,
-                  reason TEXT NOT NULL, UNIQUE(cohort_id,symbol,strategy,signal_ts,side));
+                  reason TEXT NOT NULL, episode_id TEXT, applied_at REAL,
+                  UNIQUE(cohort_id,symbol,strategy,signal_ts,side));
+                CREATE TABLE IF NOT EXISTS position_episodes(
+                  id TEXT PRIMARY KEY, cohort_id TEXT NOT NULL, symbol TEXT NOT NULL, strategy TEXT NOT NULL,
+                  opened_at REAL NOT NULL, closed_at REAL, opening_market_at REAL NOT NULL,
+                  basis_updated_at REAL, basis_updated_receipt_at REAL NOT NULL, basis_updated_market_at REAL NOT NULL,
+                  opening_basis REAL NOT NULL, remaining_basis REAL NOT NULL,
+                  opened_qty REAL NOT NULL, current_qty REAL NOT NULL,
+                  take_profit_pct REAL, stop_loss_pct REAL, realized_pnl REAL NOT NULL DEFAULT 0,
+                  status TEXT NOT NULL DEFAULT 'open', close_reason TEXT, pending_reason TEXT,
+                  protection_trigger_reason TEXT, close_receipt_at REAL,
+                  protection_triggered_at REAL, protection_trigger_price REAL,
+                  protection_trigger_return_pct REAL, protection_trigger_basis REAL,
+                  protection_trigger_threshold_pct REAL);
+                CREATE INDEX IF NOT EXISTS episode_history_idx ON position_episodes(cohort_id,symbol,strategy,opened_at);
+                CREATE TABLE IF NOT EXISTS protection_events(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, cohort_id TEXT NOT NULL, episode_id TEXT,
+                  symbol TEXT NOT NULL, strategy TEXT NOT NULL, event_type TEXT NOT NULL,
+                  reason TEXT NOT NULL, priority INTEGER NOT NULL, decided_at REAL NOT NULL,
+                  market_at REAL, request_at REAL, receipt_at REAL, price REAL,
+                  net_return_pct REAL, remaining_basis REAL, threshold_pct REAL, detail TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS marks(
                   id INTEGER PRIMARY KEY AUTOINCREMENT, cohort_id TEXT NOT NULL, symbol TEXT NOT NULL,
                   strategy TEXT NOT NULL, market_at REAL NOT NULL, request_at REAL NOT NULL,
@@ -212,18 +299,83 @@ class ForwardCohort:
                 "session_status": "TEXT NOT NULL DEFAULT 'not_started'",
                 "entry_disabled": "INTEGER NOT NULL DEFAULT 0", "clock_high_water": "REAL",
                 "session_decided_at": "REAL", "terminal_reason": "TEXT", "close_retry_after": "REAL",
+                "session_config_json": "TEXT", "protection_schema_version": "TEXT",
             }
             for name, declaration in session_columns.items():
                 if name not in columns:
                     db.execute(f"ALTER TABLE cohorts ADD COLUMN {name} {declaration}")
+            account_columns = {x[1] for x in db.execute("PRAGMA table_info(accounts)")}
+            account_migrations = {
+                "episode_id": "TEXT", "position_opened_at": "REAL",
+                "basis_updated_at": "REAL", "basis_updated_receipt_at": "REAL", "basis_updated_market_at": "REAL",
+                "position_tp_pct": "REAL", "position_sl_pct": "REAL",
+                "cooldown_after_at": "REAL", "cooldown_after_receipt_at": "REAL", "exit_reason": "TEXT",
+                "exit_priority": "INTEGER NOT NULL DEFAULT 0",
+                "protection_trigger_reason": "TEXT", "protection_triggered_at": "REAL",
+                "protection_trigger_price": "REAL", "protection_trigger_market_at": "REAL",
+                "protection_trigger_return_pct": "REAL", "protection_trigger_basis": "REAL",
+                "protection_trigger_threshold_pct": "REAL",
+            }
+            for name, declaration in account_migrations.items():
+                if name not in account_columns:
+                    db.execute(f"ALTER TABLE accounts ADD COLUMN {name} {declaration}")
+            fill_columns = {x[1] for x in db.execute("PRAGMA table_info(fills)")}
+            if "episode_id" not in fill_columns:
+                db.execute("ALTER TABLE fills ADD COLUMN episode_id TEXT")
+            if "applied_at" not in fill_columns:
+                db.execute("ALTER TABLE fills ADD COLUMN applied_at REAL")
+            episode_columns = {x[1] for x in db.execute("PRAGMA table_info(position_episodes)")}
+            for name, declaration in {
+                "basis_updated_at": "REAL", "close_receipt_at": "REAL",
+                "protection_triggered_at": "REAL", "protection_trigger_price": "REAL",
+                "protection_trigger_return_pct": "REAL", "protection_trigger_basis": "REAL",
+                "protection_trigger_threshold_pct": "REAL",
+                "pending_reason": "TEXT", "protection_trigger_reason": "TEXT",
+            }.items():
+                if name not in episode_columns:
+                    db.execute(f"ALTER TABLE position_episodes ADD COLUMN {name} {declaration}")
+            # Earlier V5.2 builds used close_reason to mean both a pending latch
+            # and a completed SELL. Migrate that ambiguity without changing any
+            # fill or realized amount: final reason remains empty until a fill.
+            db.execute("UPDATE position_episodes SET pending_reason=coalesce(pending_reason,(SELECT a.exit_reason FROM accounts a WHERE a.cohort_id=position_episodes.cohort_id AND a.symbol=position_episodes.symbol AND a.strategy=position_episodes.strategy AND a.episode_id=position_episodes.id),close_reason),close_reason=NULL WHERE status='exit_pending'")
+            # The first recorded protective decision is authoritative for
+            # older episodes whose later final close reason overwrote the
+            # original trigger. Never infer a trigger from realized P&L.
+            for episode in db.execute("SELECT id,protection_trigger_reason,protection_triggered_at,protection_trigger_price,protection_trigger_return_pct,protection_trigger_basis,protection_trigger_threshold_pct,close_reason FROM position_episodes").fetchall():
+                if episode["protection_trigger_reason"] is None:
+                    event = db.execute("SELECT reason,decided_at,price,net_return_pct,remaining_basis,threshold_pct FROM protection_events WHERE episode_id=? AND event_type IN ('TRIGGER','OVERRIDE') AND reason IN ('take_profit','stop_loss') ORDER BY id LIMIT 1", (episode["id"],)).fetchone()
+                    if event:
+                        db.execute("UPDATE position_episodes SET protection_trigger_reason=?,protection_triggered_at=coalesce(protection_triggered_at,?),protection_trigger_price=coalesce(protection_trigger_price,?),protection_trigger_return_pct=coalesce(protection_trigger_return_pct,?),protection_trigger_basis=coalesce(protection_trigger_basis,?),protection_trigger_threshold_pct=coalesce(protection_trigger_threshold_pct,?) WHERE id=?",
+                            (event["reason"],event["decided_at"],event["price"],event["net_return_pct"],event["remaining_basis"],event["threshold_pct"],episode["id"]))
             row = db.execute("SELECT * FROM cohorts ORDER BY created_at DESC,rowid DESC LIMIT 1").fetchone()
             if row is None:
                 config = self._config()
                 now = float(self.clock())
-                db.execute("INSERT INTO cohorts(id,state,created_at,config_json,session_status,clock_high_water) VALUES(?,?,?,?,?,?)",
-                    (str(uuid.uuid4()), "not_started", now, json.dumps(config, sort_keys=True), "not_started", now))
+                db.execute("INSERT INTO cohorts(id,state,created_at,config_json,session_status,clock_high_water,protection_schema_version) VALUES(?,?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), "not_started", now, json.dumps(config, sort_keys=True), "not_started", now, PROTECTION_SCHEMA))
             else:
                 now = float(self.clock())
+                current = db.execute("SELECT * FROM cohorts WHERE id=?", (row["id"],)).fetchone()
+                if current["protection_schema_version"] is None:
+                    history_count = sum(db.execute(f"SELECT count(*) FROM {table} WHERE cohort_id=?", (row["id"],)).fetchone()[0]
+                        for table in ("accounts", "decisions", "fills", "marks", "daily_observations", "warmup_prices"))
+                    if current["session_started_at"] is None and current["start_at"] is None and history_count == 0:
+                        # An empty V5.1 cohort can safely adopt the explicit V5.2
+                        # protection schema because it has no session or history.
+                        db.execute("UPDATE cohorts SET config_json=?,protection_schema_version=?,session_config_json=NULL WHERE id=?",
+                            (json.dumps(self._config(), sort_keys=True), PROTECTION_SCHEMA, row["id"]))
+                    elif current["session_started_at"] is not None or current["start_at"] is not None or history_count:
+                        # Preserve any started V5.1 session, timer, fills and
+                        # holdings, but never retrofit new protection settings.
+                        # Users may close existing holdings from fresh quotes;
+                        # an explicit archive/reset creates the next V5.2 cohort.
+                        next_state = "paused" if current["state"] in {"starting", "running"} else current["state"]
+                        next_session = "paused" if current["session_status"] == "active" else current["session_status"]
+                        db.execute("UPDATE cohorts SET protection_schema_version='legacy-v5.1',entry_disabled=1,state=?,session_status=?,reason=?,terminal_reason=coalesce(terminal_reason,?),error=NULL,launch_generation=launch_generation+1 WHERE id=?",
+                            (next_state, next_session,
+                             "Legacy V5.1 settings are frozen. New entries and resume are disabled; existing holdings and history are preserved for fresh-quote closure. Archive/reset after closing to choose V5.2 protection settings.",
+                             "Legacy V5.1 protection settings were not inferred or applied.", row["id"]))
+                        db.execute("UPDATE decisions SET status='cancelled',reason='Legacy V5.1 migration; pending actions were cancelled. Existing holdings are preserved for fresh-quote closure.' WHERE cohort_id=? AND status='pending'", (row["id"],))
                 # V5 cohorts had no timer. Preserve every account and ledger row,
                 # but fail closed for new entries; an explicit fresh-quote exit
                 # remains available for any existing paper holding.
@@ -231,17 +383,24 @@ class ForwardCohort:
                     db.execute("UPDATE cohorts SET session_status='legacy_untimed',entry_disabled=1,terminal_reason=?,clock_high_water=max(coalesce(clock_high_water,0),?) WHERE id=?",
                         ("Migrated untimed V5 cohort; entries disabled. Existing holdings are preserved for fresh-quote closure.", now, row["id"]))
                     db.execute("UPDATE decisions SET status='cancelled',reason='Migrated untimed V5 cohort; new entries disabled.' WHERE cohort_id=? AND status='pending'", (row["id"],))
-                if row["state"] in {"starting", "running", "exiting"}:
-                    clock_close = row["session_status"] == "clock_suspect" and row["expiry_policy"] == "CLOSE" and db.execute(
+                current = db.execute("SELECT * FROM cohorts WHERE id=?", (row["id"],)).fetchone()
+                if current["state"] in {"starting", "running", "exiting"}:
+                    clock_close = current["session_status"] == "clock_suspect" and current["expiry_policy"] == "CLOSE" and db.execute(
                         "SELECT count(*) FROM accounts WHERE cohort_id=? AND (qty>1e-12 OR exit_requested=1)", (row["id"],)).fetchone()[0] > 0
-                    timed_close = row["session_status"] in {"expired_pending_close", "stopped_pending_close"} or clock_close
+                    timed_close = current["session_status"] in {"expired_pending_close", "stopped_pending_close"} or clock_close
+                    pending_safety = db.execute("SELECT count(*) FROM accounts WHERE cohort_id=? AND exit_requested=1 AND exit_priority BETWEEN ? AND ?",
+                        (row["id"], EXIT_PRIORITY["take_profit"], EXIT_PRIORITY["account_drawdown"])).fetchone()[0] > 0
                     if timed_close:
                         db.execute("UPDATE cohorts SET state='exiting',reason=?,error=NULL,launch_generation=launch_generation+1 WHERE id=?",
                             ("Server restarted during an authorized close-only session; waiting for a fresh post-decision quote.", row["id"]))
+                    elif pending_safety:
+                        db.execute("UPDATE cohorts SET state='protection_pending',session_status=CASE WHEN session_status='active' THEN 'paused' ELSE session_status END,close_retry_after=?,reason=?,error=NULL,launch_generation=launch_generation+1 WHERE id=?",
+                            (now,"A V5.2 protection close was already latched before restart. It remains pending; retrying with fresh quotes only and no signal processing.",row["id"]))
+                        db.execute("UPDATE decisions SET status='cancelled',reason='Server restarted with a protective close pending; no signal catch-up.' WHERE cohort_id=? AND status='pending'", (row["id"],))
                     else:
                         db.execute("UPDATE cohorts SET state='paused',session_status=CASE WHEN session_status='active' THEN 'paused' ELSE session_status END,reason=?,error=NULL,launch_generation=launch_generation+1 WHERE id=?",
                             ("Server restarted; pending scheduled entries were cancelled. Resume explicitly; the original session deadline does not change.", row["id"]))
-                        if row["session_status"] in {"expired_exit_only", "stopped_exit_only"}:
+                        if current["session_status"] in {"expired_exit_only", "stopped_exit_only"}:
                             self._cancel_pending_entries_keep_reductions(db,row["id"],
                                 "Server restarted; entries/increases will not catch up. A pending reduction remains eligible for a fresh quote before expiry.")
                         else:
@@ -280,6 +439,15 @@ class ForwardCohort:
             "quote_age_max_seconds": MAX_QUOTE_AGE, "provider_future_tolerance_seconds": FUTURE_TOLERANCE,
             "history_warmup_points_max": 366, "warmup_is_never_pnl": True,
             "no_historical_catchup": True,
+            "position_protection_schema": PROTECTION_SCHEMA,
+            "position_protection_basis": "net liquidation on remaining weighted entry-cost basis; entry fees/slippage and estimated sell fees/slippage included",
+            "position_protection_costs_bps_per_side": {"fee": FEE_BPS, "slippage": SLIP_BPS},
+            "position_protection_trigger_clock": "atomic BTC/ETH quote; provider/request/receipt strictly newer than latest basis-changing fill application time",
+            "position_protection_exit_clock": "fresh atomic quote with provider/request/receipt strictly later than latched decision",
+            "position_protection_defaults": {"take_profit_pct": None, "stop_loss_pct": None},
+            "position_protection_max_pct": {"take_profit_pct": 100.0, "stop_loss_pct": 99.9},
+            "position_protection_step_pct": 0.1,
+            "position_protection_cooldown": "post-close daily source observation strictly later than protective close application time",
             "forward_policy_addendum_sha256": policy_sha,
             "implementation_sha256": implementation,
             "disclaimer": "CoinGecko daily aggregate USD prices are sampled-price proxies, not executable venue fills."}
@@ -338,8 +506,11 @@ class ForwardCohort:
              int(clock_suspect), "System clock moved backward or fell behind its monotonic/high-water estimate; entries are permanently disabled for this cohort.", cid))
         open_positions = db.execute("SELECT count(*) FROM accounts WHERE cohort_id=? AND qty>1e-12", (cid,)).fetchone()[0]
         if policy == "CLOSE":
-            db.execute("UPDATE accounts SET exit_requested=1,exit_decided_at=CASE WHEN exit_requested=1 THEN exit_decided_at ELSE ? END,updated_at=? WHERE cohort_id=? AND qty>1e-12",
-                (when, when, cid))
+            close_rows = db.execute("SELECT * FROM accounts WHERE cohort_id=? AND qty>1e-12", (cid,)).fetchall()
+            for account in close_rows:
+                if not account["exit_requested"] or int(account["exit_priority"] or 0) < EXIT_PRIORITY["session_close"]:
+                    self._latch_exit(db, account, reason="session_close", decided_at=when,
+                        basis=float(account["basis"]), detail=reason)
             if open_positions:
                 db.execute("UPDATE cohorts SET state='exiting' WHERE id=?", (cid,))
                 return True
@@ -375,10 +546,55 @@ class ForwardCohort:
             if not keep_reduction:
                 db.execute("UPDATE decisions SET status='cancelled',reason=? WHERE id=?", (reason, decision["id"]))
 
+    @staticmethod
+    def _record_protection_event(db, account, *, event_type: str, reason: str,
+                                 priority: int, decided_at: float, market_at: float | None = None,
+                                 request_at: float | None = None, receipt_at: float | None = None,
+                                 price: float | None = None, return_pct: float | None = None,
+                                 basis: float | None = None, threshold_pct: float | None = None,
+                                 detail: str = "") -> None:
+        db.execute("INSERT INTO protection_events(cohort_id,episode_id,symbol,strategy,event_type,reason,priority,decided_at,market_at,request_at,receipt_at,price,net_return_pct,remaining_basis,threshold_pct,detail) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (account["cohort_id"], account["episode_id"], account["symbol"], account["strategy"],
+             event_type, reason, priority, decided_at, market_at, request_at, receipt_at, price,
+             return_pct, basis, threshold_pct, detail))
+
+    def _latch_exit(self, db, account, *, reason: str, decided_at: float,
+                    market_at: float | None = None, request_at: float | None = None,
+                    receipt_at: float | None = None, price: float | None = None,
+                    return_pct: float | None = None, basis: float | None = None,
+                    threshold_pct: float | None = None, detail: str = "") -> bool:
+        """Durably request a later-quote close, allowing only higher-priority overrides."""
+        priority = EXIT_PRIORITY[reason]
+        already = bool(account["exit_requested"])
+        prior_priority = int(account["exit_priority"] or 0)
+        if already and priority <= prior_priority:
+            return False
+        self._record_protection_event(db, account,
+            event_type="OVERRIDE" if already else "TRIGGER", reason=reason,
+            priority=priority, decided_at=decided_at, market_at=market_at,
+            request_at=request_at, receipt_at=receipt_at, price=price,
+            return_pct=return_pct, basis=basis, threshold_pct=threshold_pct,
+            detail=(f"Superseded {account['exit_reason']} priority {prior_priority}. " if already else "") + detail)
+        db.execute("UPDATE accounts SET exit_requested=1,exit_decided_at=?,exit_reason=?,exit_priority=?,updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
+            (decided_at, reason, priority, decided_at, account["cohort_id"], account["symbol"], account["strategy"]))
+        if account["episode_id"]:
+            db.execute("UPDATE position_episodes SET status='exit_pending',pending_reason=? WHERE id=?",
+                (reason, account["episode_id"]))
+        if reason in {"take_profit", "stop_loss"} and account["episode_id"]:
+            db.execute("UPDATE accounts SET protection_trigger_reason=coalesce(protection_trigger_reason,?),protection_triggered_at=coalesce(protection_triggered_at,?),protection_trigger_price=coalesce(protection_trigger_price,?),protection_trigger_market_at=coalesce(protection_trigger_market_at,?),protection_trigger_return_pct=coalesce(protection_trigger_return_pct,?),protection_trigger_basis=coalesce(protection_trigger_basis,?),protection_trigger_threshold_pct=coalesce(protection_trigger_threshold_pct,?) WHERE cohort_id=? AND symbol=? AND strategy=?",
+                (reason, decided_at, price, market_at, return_pct, basis, threshold_pct,
+                 account["cohort_id"], account["symbol"], account["strategy"]))
+            db.execute("UPDATE position_episodes SET protection_trigger_reason=coalesce(protection_trigger_reason,?),protection_triggered_at=coalesce(protection_triggered_at,?),protection_trigger_price=coalesce(protection_trigger_price,?),protection_trigger_return_pct=coalesce(protection_trigger_return_pct,?),protection_trigger_basis=coalesce(protection_trigger_basis,?),protection_trigger_threshold_pct=coalesce(protection_trigger_threshold_pct,?) WHERE id=?",
+                (reason, decided_at, price, return_pct, basis, threshold_pct, account["episode_id"]))
+        db.execute("UPDATE decisions SET status='cancelled',reason=? WHERE cohort_id=? AND symbol=? AND strategy=? AND status='pending'",
+            (f"{reason.replace('_', ' ').title()} exit is latched; no entry or rebalance may cancel it.", account["cohort_id"], account["symbol"], account["strategy"]))
+        return True
+
     def _advance_session_clock(self) -> float:
         """Persist clock high-water and enforce deadline/rollback atomically."""
         launch_close = False
         launch_management = False
+        launch_protection = False
         terminal_changed = False
         with self.db() as db:
             row = self._latest(db)
@@ -423,12 +639,22 @@ class ForwardCohort:
                 newest["session_status"] in {"expired_pending_close", "stopped_pending_close", "clock_suspect"})
             launch_management = launch_management or bool(newest and newest["state"] == "running" and
                 newest["session_status"] in {"expired_exit_only", "stopped_exit_only"})
+            if newest and newest["state"] == "protection_pending":
+                retry_at = float(newest["close_retry_after"] or 0)
+                if safe_now >= retry_at:
+                    # Do not invalidate a worker which may already own the
+                    # serialized quote slot. The worker itself advances the
+                    # clock before each request; mutating its generation here
+                    # could make it stale and prevent every protective fill.
+                    launch_protection = True
         if terminal_changed:
             self.wake.set()
         if launch_close:
             self._ensure_pending_close_worker()
         elif launch_management:
             self._ensure_exit_only_worker()
+        elif launch_protection:
+            self._ensure_protection_worker()
         return safe_now
 
     def _ensure_pending_close_worker(self) -> None:
@@ -453,6 +679,51 @@ class ForwardCohort:
                 db.execute("UPDATE cohorts SET error=?,reason=? WHERE id=? AND state='exiting' AND launch_generation=?",
                     ("Close-only worker could not start; restart the local service or retry Close positions now.",
                      "The session remains terminal and pending-close; no new entries are possible.", cohort_id, generation))
+
+    def _ensure_protection_worker(self) -> None:
+        if not self.worker_lock.acquire(blocking=False):
+            return
+        cohort_id = None
+        generation = None
+        started = False
+        try:
+            with self.db() as db:
+                row = self._latest(db)
+                if not row or row["state"] != "protection_pending":
+                    return
+                pending = db.execute("SELECT count(*) FROM accounts WHERE cohort_id=? AND exit_requested=1 AND exit_priority BETWEEN ? AND ?",
+                    (row["id"], EXIT_PRIORITY["take_profit"], EXIT_PRIORITY["account_drawdown"])).fetchone()[0]
+                if not pending:
+                    db.execute("UPDATE cohorts SET state='paused',session_status=CASE WHEN session_status='active' THEN 'paused' ELSE session_status END,close_retry_after=NULL,reason='No pending protection closes remain; monitoring stays paused until explicitly resumed.' WHERE id=?",
+                        (row["id"],))
+                    return
+                cohort_id = row["id"]
+                # Reserve a new generation only after the exclusive worker slot
+                # is acquired and the pending close is revalidated.
+                generation = int(row["launch_generation"]) + 1
+                db.execute("UPDATE cohorts SET launch_generation=?,close_retry_after=NULL,error=NULL WHERE id=? AND state='protection_pending'",
+                    (generation, cohort_id))
+            self.stop_event.clear()
+            self.wake.clear()
+            self.worker = threading.Thread(target=self._run, args=(cohort_id, "protective_only", generation),
+                name="forward-protective-close", daemon=True)
+            started = True
+            try:
+                self.worker.start()
+            except BaseException:
+                started = False
+                raise
+        except BaseException:
+            if cohort_id is not None and generation is not None:
+                with self.db() as db:
+                    db.execute("UPDATE cohorts SET close_retry_after=?,reason=?,error=? WHERE id=? AND state='protection_pending' AND launch_generation=?",
+                        (float(self.clock()) + self.poll_seconds,
+                         "The protective exit remains latched; no new entries are possible. A fresh quote retry is scheduled.",
+                         "Quote-only close worker could not start; retry after the bounded interval.", cohort_id, generation))
+            raise
+        finally:
+            if not started and self.worker_lock.locked():
+                self.worker_lock.release()
 
     def _ensure_exit_only_worker(self) -> None:
         with self.db() as db:
@@ -503,7 +774,13 @@ class ForwardCohort:
             cid = cohort["id"]
             accounts = [dict(x) for x in db.execute("SELECT * FROM accounts WHERE cohort_id=? ORDER BY symbol,strategy", (cid,))]
             decisions = [dict(x) for x in db.execute("SELECT symbol,strategy,signal_ts,created_at,due_at,expires_at,target_weight,status,reason FROM decisions WHERE cohort_id=? ORDER BY signal_ts DESC,id DESC LIMIT 60", (cid,))]
-            fills = [dict(x) for x in db.execute("SELECT symbol,strategy,signal_ts,request_at,receipt_at,market_at,side,qty,raw_price,fill_price,fee,slippage,realized_pnl,reason FROM fills WHERE cohort_id=? ORDER BY id DESC LIMIT 100", (cid,))]
+            fills = [dict(x) for x in db.execute("SELECT symbol,strategy,signal_ts,request_at,receipt_at,market_at,side,qty,raw_price,fill_price,fee,slippage,realized_pnl,reason,episode_id,applied_at FROM fills WHERE cohort_id=? ORDER BY id DESC LIMIT 100", (cid,))]
+            episodes = [dict(x) for x in db.execute("SELECT * FROM position_episodes WHERE cohort_id=? ORDER BY opened_at DESC LIMIT 100", (cid,))]
+            episode_costs = {row["episode_id"]: dict(row) for row in db.execute(
+                "SELECT episode_id,count(*) AS fill_count,coalesce(sum(fee),0) AS total_fees,"
+                "coalesce(sum(slippage),0) AS total_slippage FROM fills "
+                "WHERE cohort_id=? AND episode_id IS NOT NULL GROUP BY episode_id", (cid,))}
+            protection_events = [dict(x) for x in db.execute("SELECT * FROM protection_events WHERE cohort_id=? ORDER BY id DESC LIMIT 100", (cid,))]
             baseline = json.loads(cohort["baseline_json"] or "{}")
             last_daily = json.loads(cohort["last_daily_ts_json"] or "{}")
             meta = json.loads(cohort["warmup_meta_json"] or "{}")
@@ -513,13 +790,61 @@ class ForwardCohort:
             account_views = []
             for a in accounts:
                 price = a["last_price"]
+                quote_receipt = float(a["last_receipt_at"]) if a["last_receipt_at"] is not None else None
+                quote_age = max(0.0, now - quote_receipt) if quote_receipt is not None else None
                 equity = a["cash"] + (a["qty"] * price if price is not None else 0.0)
                 initial = a["initial"]
                 nlv = a["cash"] + (a["qty"] * price * (1 - SLIP_BPS/10000) * (1 - FEE_BPS/10000) if price is not None else 0.0)
+                position_return = net_position_return_pct(float(a["qty"]), float(a["basis"]), float(price)) if price is not None else None
+                tp_price = estimated_protection_price(float(a["qty"]), float(a["basis"]), float(a["position_tp_pct"]), take_profit=True) if a["position_tp_pct"] is not None else None
+                sl_price = estimated_protection_price(float(a["qty"]), float(a["basis"]), float(a["position_sl_pct"]), take_profit=False) if a["position_sl_pct"] is not None else None
+                is_legacy = cohort["protection_schema_version"] not in {None, PROTECTION_SCHEMA}
+                monitoring = cohort["state"] == "running" and cohort["session_status"] in {
+                    "active", "expired_exit_only", "stopped_exit_only"}
+                if a["exit_requested"]:
+                    protection_state = (a["exit_reason"] or "close").replace("_", " ").title() + " pending · fresh quote required"
+                elif is_legacy and a["qty"] > 1e-12:
+                    protection_state = "Legacy holding · V5.2 TP/SL not applied"
+                elif a["qty"] > 1e-12 and (a["position_tp_pct"] is not None or a["position_sl_pct"] is not None):
+                    if monitoring and quote_age is not None and quote_age <= MAX_QUOTE_AGE:
+                        protection_state = "Monitoring on valid quotes · thresholds estimated at last quote"
+                    elif monitoring:
+                        protection_state = "Awaiting fresh quote · last-quote estimate only"
+                    else:
+                        protection_state = "Configured · monitoring paused; last-quote estimate only"
+                elif a["cooldown_after_at"] is not None:
+                    protection_state = "Flat reentry cooldown · waiting for newer daily observation"
+                elif a["qty"] > 1e-12:
+                    protection_state = "Holding · protection OFF for this position"
+                else:
+                    protection_state = "Flat"
                 account_views.append({**a, "equity": equity, "net_liquidation": nlv,
                     "return_pct": (equity / initial - 1) * 100 if initial else 0.0,
                     "asset_weight_pct": (a["qty"] * price / equity * 100 if price is not None and equity > 0 else 0.0),
-                    "status": "halted" if a["halted"] else "exit_pending" if a["exit_requested"] else cohort["state"]})
+                    "net_liquidation_return_pct": (nlv / initial - 1) * 100 if initial else 0.0,
+                    "position_net_return_pct": position_return,
+                    "estimated_take_profit_price": tp_price,
+                    "estimated_stop_loss_price": sl_price,
+                    "valuation_quote_utc": utc_iso(quote_receipt),
+                    "valuation_age_seconds": quote_age,
+                    "valuation_is_live": bool(monitoring and quote_age is not None and quote_age <= MAX_QUOTE_AGE),
+                    "protection_enabled": bool(a["position_tp_pct"] is not None or a["position_sl_pct"] is not None),
+                    "protection_state": protection_state,
+                    "status": "exit_pending" if a["exit_requested"] else "halted" if a["halted"] else cohort["state"]})
+            for episode in episodes:
+                costs = episode_costs.get(episode["id"], {})
+                # opening_basis includes all modeled entry costs on every add;
+                # remaining_basis tracks only the unsold lot. Fees/slippage and
+                # realized P&L aggregate every fill for the episode, not the
+                # API's capped recent-fill projection.
+                episode["total_entry_cost_usd"] = float(episode["opening_basis"])
+                episode["total_fees_usd"] = float(costs.get("total_fees", 0.0))
+                episode["total_slippage_usd"] = float(costs.get("total_slippage", 0.0))
+                episode["all_episode_fills"] = int(costs.get("fill_count", 0))
+                episode["net_realized_pnl_usd"] = float(episode["realized_pnl"])
+                # Trigger cause and final close cause are distinct. A later
+                # manual/session/DD override must not erase the original TP/SL.
+                episode["protection_trigger_reason"] = episode.get("protection_trigger_reason")
             newest_daily = max(last_daily.values()) if last_daily else None
             boundary = max(float(cohort["start_at"] or 0), float(cohort["resume_at"] or 0))
             boundary_next_daily = (int(boundary) // 86400 + 1) * 86400 if boundary else None
@@ -530,8 +855,12 @@ class ForwardCohort:
             marks_count = db.execute("SELECT count(*) FROM marks WHERE cohort_id=?", (cid,)).fetchone()[0]
             fills_count = db.execute("SELECT count(*) FROM fills WHERE cohort_id=?", (cid,)).fetchone()[0]
             decisions_count = db.execute("SELECT count(*) FROM decisions WHERE cohort_id=?", (cid,)).fetchone()[0]
+            episodes_count = db.execute("SELECT count(*) FROM position_episodes WHERE cohort_id=?", (cid,)).fetchone()[0]
+            protection_events_count = db.execute("SELECT count(*) FROM protection_events WHERE cohort_id=?", (cid,)).fetchone()[0]
             elapsed_calendar_days = max(0.0, (now - float(start_at)) / 86400) if start_at is not None else 0.0
             forward_days = float(forward_days_count)
+            session_config = json.loads(cohort["session_config_json"] or "{}")
+            qa_fixture = bool(session_config.get("qa_fixture_label") or self.qa_fixture_label)
         due_ts = next_eligible
         return {"cohort_id": cid, "state": cohort["state"], "started_at": utc_iso(start_at),
             "resume_at": utc_iso(cohort["resume_at"]), "config": config, "config_hash": cohort["config_hash"],
@@ -541,6 +870,10 @@ class ForwardCohort:
             "session_deadline_epoch": cohort["session_deadline_at"],
             "session_duration_minutes": cohort["session_duration_minutes"],
             "expiry_policy": cohort["expiry_policy"], "session_status": cohort["session_status"],
+            "session_config": session_config, "qa_fixture": qa_fixture,
+            "protection_schema_version": cohort["protection_schema_version"],
+            "protection_legacy_frozen": bool(cohort["protection_schema_version"] not in {None, PROTECTION_SCHEMA}),
+            "protection_basis": config.get("position_protection_basis"),
             "session_decided_at_utc": utc_iso(cohort["session_decided_at"]),
             "entry_disabled": bool(cohort["entry_disabled"]),
             "clock_integrity": "rollback_detected" if cohort["session_status"] == "clock_suspect" else "high_water_checked",
@@ -558,12 +891,15 @@ class ForwardCohort:
             "last_quote_receipt": utc_iso(cohort["last_quote_receipt"]),
             "latest_quotes": latest_quotes, "reason": cohort["reason"], "error": cohort["error"],
             "accounts": account_views, "decisions": decisions, "fills": fills,
+            "position_episodes": episodes, "protection_events": protection_events,
             "totals": {"fills": fills_count, "recorded_decisions": decisions_count,
                 "forward_observations": forward_observations, "post_start_marks": marks_count,
-                "all_forward_fills": fills_count}}
+                "all_forward_fills": fills_count, "position_episodes": episodes_count,
+                "protection_events": protection_events_count}}
 
     def control(self, action: str, *, confirm: str | None = None,
-                duration_minutes: int | None = None, expiry_policy: str | None = None) -> dict:
+                duration_minutes: int | None = None, expiry_policy: str | None = None,
+                take_profit_pct: object = None, stop_loss_pct: object = None) -> dict:
         if action not in {"start", "pause", "resume", "exit", "stop", "reset"}:
             raise ValueError("Choose start, pause, resume, exit, stop or reset.")
         if action == "start":
@@ -573,6 +909,10 @@ class ForwardCohort:
                 raise ValueError("Session duration must be an integer from 1 to 259200 minutes.")
             if expiry_policy not in {"CLOSE", "EXIT_ONLY"}:
                 raise ValueError("Choose CLOSE or EXIT_ONLY for the session expiry policy.")
+            take_profit_pct = validate_protection_threshold(take_profit_pct,
+                name="Take-profit threshold", maximum=100.0)
+            stop_loss_pct = validate_protection_threshold(stop_loss_pct,
+                name="Stop-loss threshold", maximum=99.9)
         if action == "reset" and confirm != "RESET":
             raise ValueError("Reset requires explicit confirmation.")
         now = self._advance_session_clock()
@@ -594,12 +934,23 @@ class ForwardCohort:
                 deadline = start_at + duration_minutes * 60
                 session_id = str(uuid.uuid4())
                 config = json.loads(row["config_json"])
+                session_config = {"session_id": session_id, "started_at": start_at,
+                    "deadline_at": deadline, "duration_minutes": duration_minutes,
+                    "expiry_policy": expiry_policy,
+                    "position_protection": {"take_profit_pct": take_profit_pct,
+                        "stop_loss_pct": stop_loss_pct, "schema": PROTECTION_SCHEMA,
+                        "basis": config["position_protection_basis"],
+                        "fee_bps_per_side": FEE_BPS, "slippage_bps_per_side": SLIP_BPS,
+                        "trigger_requires_quote_after_latest_basis_fill_application": True,
+                        "exit_requires_quote_after_decision": True,
+                        "cooldown_requires_source_daily_after_exit_fill_application": True}}
                 config_hash = hashlib.sha256(_canonical({"id": cid, "session_id": session_id,
                     "start_at": start_at, "deadline_at": deadline, "duration_minutes": duration_minutes,
-                    "expiry_policy": expiry_policy, "config": config})).hexdigest()
+                    "expiry_policy": expiry_policy, "config": config,
+                    "session_config": session_config})).hexdigest()
                 generation = int(row["launch_generation"]) + 1
-                db.execute("UPDATE cohorts SET state='starting',start_at=?,resume_at=NULL,config_hash=?,reason=?,error=NULL,launch_generation=?,session_id=?,session_started_at=?,session_deadline_at=?,session_duration_minutes=?,expiry_policy=?,session_status='active',entry_disabled=0,clock_high_water=max(coalesce(clock_high_water,0),?),session_decided_at=NULL,terminal_reason=NULL WHERE id=?",
-                    (start_at, config_hash, "Session timer started at server acceptance; warmup counts toward the deadline and is not performance.", generation, session_id, start_at, deadline, duration_minutes, expiry_policy, start_at, cid))
+                db.execute("UPDATE cohorts SET state='starting',start_at=?,resume_at=NULL,config_hash=?,reason=?,error=NULL,launch_generation=?,session_id=?,session_started_at=?,session_deadline_at=?,session_duration_minutes=?,expiry_policy=?,session_status='active',entry_disabled=0,clock_high_water=max(coalesce(clock_high_water,0),?),session_decided_at=NULL,terminal_reason=NULL,session_config_json=?,protection_schema_version=? WHERE id=?",
+                    (start_at, config_hash, "Session timer started at server acceptance; warmup counts toward the deadline and is not performance.", generation, session_id, start_at, deadline, duration_minutes, expiry_policy, start_at, json.dumps(session_config, sort_keys=True), PROTECTION_SCHEMA, cid))
                 for symbol in SYMBOLS:
                     for strategy in STRATEGIES:
                         db.execute("INSERT OR IGNORE INTO accounts(cohort_id,symbol,strategy,initial,cash,peak_nlv,updated_at) VALUES(?,?,?,?,?,?,?)",
@@ -615,6 +966,8 @@ class ForwardCohort:
                     raise RuntimeError("Only a paused cohort can resume.")
                 if session == "legacy_untimed":
                     raise RuntimeError("This migrated untimed cohort has new entries disabled. Use Close positions now or export and explicitly reset.")
+                if row["protection_schema_version"] != PROTECTION_SCHEMA and row["session_started_at"] is not None:
+                    raise RuntimeError("This started V5.1 cohort is frozen without retroactive TP/SL settings. Preserve or close its holdings, then explicitly archive/reset for a new V5.2 session.")
                 if session not in {"paused", "expired_exit_only", "stopped_exit_only"}:
                     raise RuntimeError("This cohort has no resumable authorized session. Export and explicitly reset to begin a new one.")
                 pending_exit = db.execute("SELECT count(*) FROM accounts WHERE cohort_id=? AND exit_requested=1", (cid,)).fetchone()[0]
@@ -639,13 +992,20 @@ class ForwardCohort:
                     raise RuntimeError("Only a running cohort can pause.")
                 if session in {"expired_pending_close", "stopped_pending_close", "clock_suspect"}:
                     raise RuntimeError("The session has a pending close; pause cannot cancel or defer its fresh-quote closure.")
+                latched_closes = db.execute("SELECT count(*) FROM accounts WHERE cohort_id=? AND exit_requested=1 AND exit_priority BETWEEN ? AND ?",
+                    (cid, EXIT_PRIORITY["take_profit"], EXIT_PRIORITY["account_drawdown"])).fetchone()[0]
                 next_session = "paused" if session == "active" else session
-                db.execute("UPDATE cohorts SET state='paused',session_status=?,reason=?,error=NULL,launch_generation=launch_generation+1 WHERE id=?",
-                    (next_session, "Paused by user. Existing positions remain held; the original session deadline continues without extension.", cid))
+                if latched_closes:
+                    db.execute("UPDATE cohorts SET state='protection_pending',session_status=?,reason=?,error=NULL,close_retry_after=NULL,launch_generation=launch_generation+1 WHERE id=?",
+                        (next_session, "Signal monitoring is paused. A previously latched protective close continues quote-only; the timer is unchanged.", cid))
+                    launch_mode, launch_id = "protection_only", cid
+                else:
+                    db.execute("UPDATE cohorts SET state='paused',session_status=?,reason=?,error=NULL,launch_generation=launch_generation+1 WHERE id=?",
+                        (next_session, "Paused by user. Existing positions remain held and unmonitored; the original session deadline continues without extension.", cid))
                 if session in {"expired_exit_only", "stopped_exit_only"}:
                     self._cancel_pending_entries_keep_reductions(db,cid,
                         "Exit-only management paused; entries/increases are cancelled, but an already scheduled reduction remains eligible for a fresh quote before expiry.")
-                else:
+                elif not latched_closes:
                     db.execute("UPDATE decisions SET status='cancelled',reason='User paused; scheduled action cancelled.' WHERE cohort_id=? AND status='pending'", (cid,))
                 self.wake.set()
             elif action == "exit":
@@ -655,7 +1015,9 @@ class ForwardCohort:
                 if session in {"finished", "not_started"}:
                     raise RuntimeError("There is no open paper session to close.")
                 generation = int(row["launch_generation"]) + 1
-                db.execute("UPDATE accounts SET exit_requested=1,exit_decided_at=?,updated_at=? WHERE cohort_id=? AND qty>1e-12 AND exit_requested=0", (now, now, cid))
+                for account in db.execute("SELECT * FROM accounts WHERE cohort_id=? AND qty>1e-12", (cid,)).fetchall():
+                    self._latch_exit(db, account, reason="manual_close", decided_at=now,
+                        basis=float(account["basis"]), detail="User selected Close positions now.")
                 db.execute("UPDATE decisions SET status='cancelled',reason='Close positions now; waiting for a fresh post-decision quote.' WHERE cohort_id=? AND status='pending'", (cid,))
                 remaining = db.execute("SELECT count(*) FROM accounts WHERE cohort_id=? AND (qty>1e-12 OR exit_requested=1)", (cid,)).fetchone()[0]
                 new_status = "stopped_pending_close" if remaining else "finished"
@@ -692,15 +1054,17 @@ class ForwardCohort:
                 db.execute("UPDATE cohorts SET state='reset',reset_at=?,reason=?,error=NULL,entry_disabled=1,launch_generation=? WHERE id=?",
                     (now, "Confirmed archive/reset; prior session and all cohort records remain available in export.", generation, cid))
                 db.execute("UPDATE decisions SET status='cancelled',reason='Confirmed cohort archive/reset.' WHERE cohort_id=? AND status='pending'", (cid,))
-                db.execute("INSERT INTO cohorts(id,state,created_at,config_json,session_status,clock_high_water,reason) VALUES(?,?,?,?,?,?,?)",
+                db.execute("INSERT INTO cohorts(id,state,created_at,config_json,session_status,clock_high_water,reason,protection_schema_version) VALUES(?,?,?,?,?,?,?,?)",
                     (str(uuid.uuid4()), "not_started", now, json.dumps(self._config(), sort_keys=True), "not_started", now,
-                     "New cohort identity. Prior cohorts, timer choices, fills and decisions remain archived."))
+                     "New V5.2 cohort; optional per-position protection remains OFF until explicit Start review.", PROTECTION_SCHEMA))
                 self.wake.set()
         if launch_mode and launch_id:
             if launch_mode == "close_only":
                 self._ensure_pending_close_worker()
             elif launch_mode == "management_only":
                 self._ensure_exit_only_worker()
+            elif launch_mode == "protection_only":
+                self._ensure_protection_worker()
             else:
                 self._launch(launch_id, launch_mode, generation)
         return self.state()
@@ -737,6 +1101,12 @@ class ForwardCohort:
                     # Persist the pending close so service startup can continue
                     # quote-only management after a fresh request.
                     pass
+                elif db.execute("SELECT count(*) FROM accounts WHERE cohort_id=? AND exit_requested=1 AND exit_priority BETWEEN ? AND ?",
+                        (row["id"],EXIT_PRIORITY["take_profit"],EXIT_PRIORITY["account_drawdown"])).fetchone()[0] > 0:
+                    session_status = "paused" if row["session_status"] == "active" else row["session_status"]
+                    db.execute("UPDATE cohorts SET state='protection_pending',session_status=?,close_retry_after=?,reason=?,error=NULL,launch_generation=launch_generation+1 WHERE id=?",
+                        (session_status,float(self.clock()),"Server stopped with a protective close latched. On restart, fresh quote-only closure resumes; signals remain paused.",row["id"]))
+                    db.execute("UPDATE decisions SET status='cancelled',reason='Server stopped with a protective close pending; no catch-up.' WHERE cohort_id=? AND status='pending'",(row["id"],))
                 else:
                     session_status = "paused" if row["session_status"] == "active" else row["session_status"]
                     db.execute("UPDATE cohorts SET state='paused',session_status=?,reason=?,error=NULL,launch_generation=launch_generation+1 WHERE id=?",
@@ -770,26 +1140,26 @@ class ForwardCohort:
 
     def _run(self, cohort_id: str, mode: str, generation: int) -> None:
         try:
-            if mode not in {"exit_only", "close_only", "management_only"}:
+            if mode not in {"exit_only", "close_only", "management_only", "protective_only"}:
                 if not self._initialize(cohort_id, mode, generation):
                     return
                 self.wake.wait(self.poll_seconds)
                 self.wake.clear()
-            while not self.stop_event.is_set() and self._is_current(cohort_id, ("running", "exiting"), generation):
+            while not self.stop_event.is_set() and self._is_current(cohort_id, ("running", "exiting", "protection_pending"), generation):
                 if self.stop_event.is_set():
                     break
                 try:
                     now = self._advance_session_clock()
                     if self._is_current(cohort_id, ("running",), generation):
                         self._maybe_refresh_history(cohort_id, now)
-                    if not self._is_current(cohort_id, ("running", "exiting"), generation):
+                    if not self._is_current(cohort_id, ("running", "exiting", "protection_pending"), generation):
                         break
                     quotes = validate_batch(self.fetch_quotes(), self._advance_session_clock())
                     self._process_quote_batch(cohort_id, quotes, self._advance_session_clock(), generation=generation)
                 except Exception as exc:
                     self._pause_error(cohort_id, f"Public feed unavailable or invalid: {str(exc)[:300]}", generation)
                     break
-                if not self._is_current(cohort_id, ("running", "exiting"), generation):
+                if not self._is_current(cohort_id, ("running", "exiting", "protection_pending"), generation):
                     break
                 self.wake.wait(self.poll_seconds)
                 self.wake.clear()
@@ -960,6 +1330,19 @@ class ForwardCohort:
                 for strategy in STRATEGIES:
                     target = targets.get(strategy)
                     active = bool(target is not None and target > 0)
+                    account = db.execute("SELECT cooldown_after_at FROM accounts WHERE cohort_id=? AND symbol=? AND strategy=?",
+                        (cohort_id, symbol, strategy)).fetchone()
+                    cooldown = float(account["cooldown_after_at"]) if account and account["cooldown_after_at"] is not None else None
+                    if cooldown is not None and signal_ts <= cooldown:
+                        db.execute("INSERT OR IGNORE INTO decisions(cohort_id,symbol,strategy,signal_ts,created_at,due_at,expires_at,target_weight,status,reason,source_observation_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (cohort_id,symbol,strategy,signal_ts,created,due,due+ENTRY_EXPIRY_SECONDS,target,"no_trade",
+                             "Protective-exit cooldown: this account requires a daily source timestamp strictly after the protective close was applied.",signal_ts))
+                        db.execute("UPDATE accounts SET signal_active=0,updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
+                            (created,cohort_id,symbol,strategy))
+                        continue
+                    if cooldown is not None:
+                        db.execute("UPDATE accounts SET cooldown_after_at=NULL,cooldown_after_receipt_at=NULL WHERE cohort_id=? AND symbol=? AND strategy=?",
+                            (cohort_id,symbol,strategy))
                     db.execute("INSERT OR IGNORE INTO decisions(cohort_id,symbol,strategy,signal_ts,created_at,due_at,expires_at,target_weight,status,reason,source_observation_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         (cohort_id, symbol, strategy, signal_ts, created, due, due+ENTRY_EXPIRY_SECONDS, target, "pending" if target is not None else "skipped",
                          "New post-start daily signal; scheduled 04:00 UTC; expires 04:15 UTC." if target is not None else "Invalid feature window; no signal catch-up.", signal_ts))
@@ -978,18 +1361,30 @@ class ForwardCohort:
         # Validate both assets before the transaction; no partial mark/fill round.
         safe_now = self._advance_session_clock()
         quotes = validate_batch(quotes, max(float(now), safe_now))
-        if not self._is_current(cohort_id, ("running", "exiting"), generation):
+        if not self._is_current(cohort_id, ("running", "exiting", "protection_pending"), generation):
             return
         request_at = quotes[SYMBOLS[0]]["requested_at"]
         receipt_at = max(quotes[s]["observed_at"] for s in SYMBOLS)
         batch_hash = hashlib.sha256(_canonical(quotes)).hexdigest()
         with self.db() as db:
             cohort = db.execute("SELECT * FROM cohorts WHERE id=?", (cohort_id,)).fetchone()
-            if not cohort or cohort["state"] not in {"running", "exiting"}:
+            if not cohort or cohort["state"] not in {"running", "exiting", "protection_pending"}:
                 return
             if generation is not None and int(cohort["launch_generation"]) != generation:
                 return
+            prior_batch = db.execute("SELECT payload_hash FROM quote_batches WHERE cohort_id=? AND request_at=?", (cohort_id, request_at)).fetchone()
+            if prior_batch:
+                if prior_batch["payload_hash"] == batch_hash:
+                    return
+                raise ValueError("A quote request timestamp was already consumed with different payload; the batch was rejected.")
+            if ((cohort["last_quote_request"] is not None and request_at <= float(cohort["last_quote_request"])) or
+                    (cohort["last_quote_receipt"] is not None and receipt_at <= float(cohort["last_quote_receipt"]))):
+                return
+            prior_quotes = json.loads(cohort["latest_quote_json"] or "{}")
+            if any(s in prior_quotes and float(quotes[s]["market_at"]) < float(prior_quotes[s]["market_at"]) for s in SYMBOLS):
+                return
             transaction_now, rollback = self._clock_sample(cohort["clock_high_water"])
+            decision_now = max(transaction_now, receipt_at)
             db.execute("UPDATE cohorts SET clock_high_water=max(coalesce(clock_high_water,0),?) WHERE id=?",
                 (transaction_now, cohort_id))
             terminalized = False
@@ -1010,48 +1405,119 @@ class ForwardCohort:
                 deadline > 0 and transaction_now < deadline and request_at < deadline and receipt_at < deadline and
                 request_at > start_at and receipt_at < deadline)
             exit_only = session_status in {"expired_exit_only", "stopped_exit_only"}
-            db.execute("INSERT OR IGNORE INTO quote_batches VALUES(?,?,?,?)", (cohort_id, request_at, receipt_at, batch_hash))
+            session_config = json.loads(cohort["session_config_json"] or "{}")
+            protection_config = session_config.get("position_protection", {})
+            protective_only = cohort["state"] == "protection_pending"
+            db.execute("INSERT INTO quote_batches VALUES(?,?,?,?)", (cohort_id, request_at, receipt_at, batch_hash))
             for symbol in SYMBOLS:
                 quote = quotes[symbol]
                 raw = quote["price"]
                 account_rows = db.execute("SELECT * FROM accounts WHERE cohort_id=? AND symbol=?", (cohort_id, symbol)).fetchall()
                 for account in account_rows:
-                    decision_time = float(account["exit_decided_at"] or 0)
-                    # Drawdown is measured on quote-based net liquidation. A
-                    # breach creates a safety exit decision; the same quote
-                    # cannot fill it. The next fresh batch may execute it.
+                    # A quote-only protection worker manages only exits that
+                    # were already latched before monitoring paused. Other
+                    # accounts remain untouched until explicit resume.
+                    if protective_only and not account["exit_requested"]:
+                        continue
                     equity = float(account["cash"]) + float(account["qty"]) * raw
                     nlv = float(account["cash"]) + float(account["qty"]) * raw * (1-SLIP_BPS/10000) * (1-FEE_BPS/10000)
                     peak = max(float(account["peak_nlv"]), nlv)
                     dd = max(0.0, 1 - nlv/peak) if peak else 0.0
-                    just_halted = False
+                    original_priority = int(account["exit_priority"] or 0)
+                    # Manual/session CLOSE and existing account-drawdown behavior
+                    # outrank per-position protection. A newly crossed DD is a
+                    # decision on this quote, never a same-quote fill.
                     if not account["halted"] and dd >= DRAWNDOWN_LIMIT:
-                        db.execute("UPDATE accounts SET halted=1,exit_requested=1,exit_decided_at=?,peak_nlv=?,max_drawdown=max(max_drawdown,?),updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
-                            (receipt_at, peak, dd, receipt_at, cohort_id, symbol, account["strategy"]))
-                        db.execute("UPDATE decisions SET status='cancelled',reason='Risk halt; awaiting a fresh post-decision quote.' WHERE cohort_id=? AND symbol=? AND strategy=? AND status='pending'", (cohort_id, symbol, account["strategy"]))
-                        account = dict(account); account["halted"] = 1; account["exit_requested"] = 1; account["exit_decided_at"] = receipt_at
-                        just_halted = True
-                    # A requested safety exit needs provider/request/receipt
-                    # timestamps all strictly after its own decision timestamp.
-                    close_after = max(float(account["exit_decided_at"] or 0), start_at)
-                    if account["exit_requested"] and not just_halted and float(quote["market_at"]) > close_after and request_at > close_after and receipt_at > close_after:
-                        qty = float(account["qty"])
-                        if qty > 0:
-                            sell = risk.solve_trade(float(account["cash"]), qty, raw, 0.0, FEE_BPS, SLIP_BPS)
-                            if sell:
-                                proceeds = sell["cash"] - float(account["cash"])
-                                pnl = proceeds - float(account["basis"])
-                                signal_key = int(float(account["exit_decided_at"]))
-                                db.execute("INSERT OR IGNORE INTO fills(cohort_id,symbol,strategy,signal_ts,request_at,receipt_at,market_at,side,qty,raw_price,fill_price,fee,slippage,realized_pnl,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                    (cohort_id,symbol,account["strategy"],signal_key,request_at,receipt_at,quote["market_at"],"SELL",qty,raw,raw*(1-SLIP_BPS/10000),sell["fee"],sell["slippage"],pnl,"fresh_quote_safety_exit"))
-                                db.execute("UPDATE accounts SET cash=?,qty=0,basis=0,fees=fees+?,slippage=slippage+?,realized_pnl=realized_pnl+?,exit_requested=0,last_price=?,last_market_at=?,last_receipt_at=?,peak_nlv=?,max_drawdown=max(max_drawdown,?),updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
-                                    (sell["cash"],sell["fee"],sell["slippage"],pnl,raw,quote["market_at"],receipt_at,max(peak,sell["cash"]),dd,receipt_at,cohort_id,symbol,account["strategy"]))
+                        db.execute("UPDATE accounts SET halted=1,peak_nlv=?,max_drawdown=max(max_drawdown,?),updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
+                            (peak, dd, receipt_at, cohort_id, symbol, account["strategy"]))
+                        account = dict(account); account["halted"] = 1
+                        if not account["exit_requested"] or original_priority < EXIT_PRIORITY["account_drawdown"]:
+                            self._latch_exit(db, account, reason="account_drawdown", decided_at=decision_now,
+                                market_at=quote["market_at"], request_at=request_at, receipt_at=receipt_at,
+                                price=raw, basis=float(account["basis"]), detail="Existing 10% account net-liquidation drawdown halt.")
+                            account = db.execute("SELECT * FROM accounts WHERE cohort_id=? AND symbol=? AND strategy=?",
+                                (cohort_id, symbol, account["strategy"])).fetchone()
+                            # The current quote establishes the halt; it cannot fill it.
+                            db.execute("UPDATE accounts SET last_price=?,last_market_at=?,last_receipt_at=?,peak_nlv=?,max_drawdown=max(max_drawdown,?),updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
+                                (raw, quote["market_at"], receipt_at, peak, dd, receipt_at, cohort_id, symbol, account["strategy"]))
+                            db.execute("INSERT OR IGNORE INTO marks(cohort_id,symbol,strategy,market_at,request_at,receipt_at,price,equity,net_liquidation,drawdown,exposure) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                (cohort_id, symbol, account["strategy"], quote["market_at"], request_at, receipt_at, raw, equity, nlv, dd,
+                                 float(account["qty"])*raw/equity if equity > 0 else 0.0))
+                            continue
+                    # Any close latch is sticky. A higher-priority event records
+                    # a new decision timestamp; only a subsequent fresh batch
+                    # with all timestamps strictly later may execute it.
+                    if account["exit_requested"]:
+                        close_after = max(float(account["exit_decided_at"] or 0), start_at)
+                        fresh_after_decision = (float(quote["market_at"]) > close_after and
+                            request_at > close_after and receipt_at > close_after)
+                        if fresh_after_decision:
+                            qty = float(account["qty"])
+                            if qty > 0:
+                                sell = risk.solve_trade(float(account["cash"]), qty, raw, 0.0, FEE_BPS, SLIP_BPS)
+                                if sell:
+                                    proceeds = sell["cash"] - float(account["cash"])
+                                    basis = float(account["basis"])
+                                    pnl = proceeds - basis
+                                    reason = account["exit_reason"] or "manual_close"
+                                    signal_key = int(float(account["exit_decided_at"]))
+                                    episode_id = account["episode_id"]
+                                    self._record_protection_event(db, account, event_type="FILL", reason=reason,
+                                        priority=int(account["exit_priority"] or EXIT_PRIORITY.get(reason, 0)),
+                                        decided_at=decision_now, market_at=quote["market_at"],
+                                        request_at=request_at, receipt_at=receipt_at, price=raw,
+                                        return_pct=net_position_return_pct(qty, basis, raw), basis=basis,
+                                        threshold_pct=float(account["protection_trigger_threshold_pct"]) if account["protection_trigger_threshold_pct"] is not None else None,
+                                        detail="Paper SELL filled from a fresh quote after the latched decision; modeled execution costs apply.")
+                                    db.execute("INSERT OR IGNORE INTO fills(cohort_id,symbol,strategy,signal_ts,request_at,receipt_at,market_at,side,qty,raw_price,fill_price,fee,slippage,realized_pnl,reason,episode_id,applied_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                        (cohort_id,symbol,account["strategy"],signal_key,request_at,receipt_at,quote["market_at"],"SELL",qty,raw,raw*(1-SLIP_BPS/10000),sell["fee"],sell["slippage"],pnl,reason,episode_id,decision_now))
+                                    if episode_id:
+                                        db.execute("UPDATE position_episodes SET closed_at=?,close_receipt_at=?,remaining_basis=0,current_qty=0,realized_pnl=realized_pnl+?,status='closed',close_reason=?,pending_reason=NULL WHERE id=?",
+                                            (decision_now,receipt_at,pnl,reason,episode_id))
+                                    protective_fill = reason in {"take_profit", "stop_loss"}
+                                    cooldown = decision_now if protective_fill else account["cooldown_after_at"]
+                                    cooldown_receipt = receipt_at if protective_fill else account["cooldown_after_receipt_at"]
+                                    db.execute("UPDATE accounts SET cash=?,qty=0,basis=0,fees=fees+?,slippage=slippage+?,realized_pnl=realized_pnl+?,exit_requested=0,exit_reason=NULL,exit_priority=0,episode_id=NULL,position_opened_at=NULL,basis_updated_at=NULL,basis_updated_receipt_at=NULL,basis_updated_market_at=NULL,position_tp_pct=NULL,position_sl_pct=NULL,cooldown_after_at=?,cooldown_after_receipt_at=?,signal_active=0,protection_trigger_reason=NULL,protection_triggered_at=NULL,protection_trigger_price=NULL,protection_trigger_market_at=NULL,protection_trigger_return_pct=NULL,protection_trigger_basis=NULL,protection_trigger_threshold_pct=NULL,last_price=?,last_market_at=?,last_receipt_at=?,peak_nlv=?,max_drawdown=max(max_drawdown,?),updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
+                                        (sell["cash"],sell["fee"],sell["slippage"],pnl,cooldown,cooldown_receipt,raw,quote["market_at"],receipt_at,max(peak,sell["cash"]),dd,decision_now,cohort_id,symbol,account["strategy"]))
+                            else:
+                                db.execute("UPDATE accounts SET exit_requested=0,exit_reason=NULL,exit_priority=0,last_price=?,last_market_at=?,last_receipt_at=?,updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
+                                    (raw,quote["market_at"],receipt_at,receipt_at,cohort_id,symbol,account["strategy"]))
                         else:
-                            db.execute("UPDATE accounts SET exit_requested=0,last_price=?,last_market_at=?,last_receipt_at=?,updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
-                                (raw,quote["market_at"],receipt_at,receipt_at,cohort_id,symbol,account["strategy"]))
-                        # No scheduled decisions are allowed after a safety exit.
+                            db.execute("UPDATE accounts SET last_price=?,last_market_at=?,last_receipt_at=?,peak_nlv=?,max_drawdown=max(max_drawdown,?),updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
+                                (raw,quote["market_at"],receipt_at,peak,dd,receipt_at,cohort_id,symbol,account["strategy"]))
                         continue
-                    if account["halted"] or cohort["state"] == "exiting" or session_status in {"clock_suspect", "legacy_untimed", "finished", "not_started"}:
+                    # Protections are evaluated only while the cohort is actively
+                    # monitoring. A quote must be a new provider observation after
+                    # the latest basis-changing fill and prior accepted quote.
+                    if (not protective_only and cohort["state"] == "running" and
+                            session_status in {"active", "expired_exit_only", "stopped_exit_only"} and
+                            float(account["qty"]) > 1e-12 and not account["halted"] and
+                            account["position_opened_at"] is not None and
+                            account["basis_updated_receipt_at"] is not None and
+                            account["basis_updated_market_at"] is not None and
+                            float(quote["market_at"]) > max(float(account["basis_updated_market_at"]), float(account["basis_updated_at"] or 0), float(account["last_market_at"] or 0)) and
+                            request_at > max(float(account["basis_updated_receipt_at"]), float(account["basis_updated_at"] or 0)) and
+                            receipt_at > max(float(account["basis_updated_receipt_at"]), float(account["basis_updated_at"] or 0))):
+                        position_return = net_position_return_pct(float(account["qty"]), float(account["basis"]), raw)
+                        hit_reason = None
+                        hit_threshold = None
+                        if account["position_sl_pct"] is not None and position_return is not None and _reaches_protection_threshold(position_return,float(account["position_sl_pct"]),take_profit=False):
+                            hit_reason, hit_threshold = "stop_loss", float(account["position_sl_pct"])
+                        elif account["position_tp_pct"] is not None and position_return is not None and _reaches_protection_threshold(position_return,float(account["position_tp_pct"]),take_profit=True):
+                            hit_reason, hit_threshold = "take_profit", float(account["position_tp_pct"])
+                        if hit_reason:
+                            self._latch_exit(db, account, reason=hit_reason, decided_at=decision_now,
+                                market_at=quote["market_at"], request_at=request_at, receipt_at=receipt_at,
+                                price=raw, return_pct=position_return, basis=float(account["basis"]),
+                                threshold_pct=hit_threshold,
+                                detail="Threshold crossed on remaining-lot net liquidation after modeled entry and estimated exit costs.")
+                            account = db.execute("SELECT * FROM accounts WHERE cohort_id=? AND symbol=? AND strategy=?",
+                                (cohort_id, symbol, account["strategy"])).fetchone()
+                            db.execute("UPDATE accounts SET last_price=?,last_market_at=?,last_receipt_at=?,peak_nlv=?,max_drawdown=max(max_drawdown,?),updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
+                                (raw,quote["market_at"],receipt_at,peak,dd,receipt_at,cohort_id,symbol,account["strategy"]))
+                            continue
+                    if (account["halted"] or cohort["state"] in {"exiting", "protection_pending"} or
+                            session_status in {"clock_suspect", "legacy_untimed", "finished", "not_started"}):
                         db.execute("UPDATE accounts SET peak_nlv=?,max_drawdown=max(max_drawdown,?),last_price=?,last_market_at=?,last_receipt_at=?,updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
                             (peak,dd,raw,quote["market_at"],receipt_at,receipt_at,cohort_id,symbol,account["strategy"]))
                         continue
@@ -1087,18 +1553,50 @@ class ForwardCohort:
                         if order:
                             before_qty=float(account["qty"]); after_qty=order["qty"]
                             side=order["side"]; fill_price=raw*(1+SLIP_BPS/10000) if side=="BUY" else raw*(1-SLIP_BPS/10000)
-                            pnl=0.0; basis=float(account["basis"])
-                            if side=="BUY": basis += order["raw_notional"]+order["fee"]+order["slippage"]
+                            pnl=0.0; basis=float(account["basis"]); episode_id=account["episode_id"]
+                            if side=="BUY":
+                                basis_added=order["raw_notional"]+order["fee"]+order["slippage"]
+                                basis += basis_added
+                                if before_qty <= 1e-12:
+                                    episode_id=str(uuid.uuid4())
+                                    position_tp_pct=protection_config.get("take_profit_pct")
+                                    position_sl_pct=protection_config.get("stop_loss_pct")
+                                    position_opened_at=decision_now
+                                    db.execute("INSERT INTO position_episodes(id,cohort_id,symbol,strategy,opened_at,opening_market_at,basis_updated_at,basis_updated_receipt_at,basis_updated_market_at,opening_basis,remaining_basis,opened_qty,current_qty,take_profit_pct,stop_loss_pct,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open')",
+                                        (episode_id,cohort_id,symbol,account["strategy"],decision_now,quote["market_at"],decision_now,receipt_at,quote["market_at"],basis_added,basis_added,order["quantity"],after_qty,position_tp_pct,position_sl_pct))
+                                else:
+                                    position_tp_pct=account["position_tp_pct"]
+                                    position_sl_pct=account["position_sl_pct"]
+                                    position_opened_at=account["position_opened_at"]
+                                    if episode_id:
+                                        db.execute("UPDATE position_episodes SET opening_basis=opening_basis+?,remaining_basis=remaining_basis+?,opened_qty=opened_qty+?,current_qty=?,basis_updated_at=?,basis_updated_receipt_at=?,basis_updated_market_at=? WHERE id=?",
+                                            (basis_added,basis_added,order["quantity"],after_qty,decision_now,receipt_at,quote["market_at"],episode_id))
                             else:
                                 closed=min(before_qty,order["quantity"])
                                 portion=basis*(closed/before_qty) if before_qty else 0.0
                                 proceeds=order["raw_notional"]-order["fee"]-order["slippage"]
                                 pnl=proceeds-portion; basis=max(0.0,basis-portion)
+                                position_tp_pct=account["position_tp_pct"]
+                                position_sl_pct=account["position_sl_pct"]
+                                position_opened_at=account["position_opened_at"]
+                                if episode_id:
+                                    if after_qty <= 1e-12:
+                                        db.execute("UPDATE position_episodes SET closed_at=?,close_receipt_at=?,remaining_basis=0,current_qty=0,realized_pnl=realized_pnl+?,status='closed',close_reason='strategy_exit',pending_reason=NULL,basis_updated_at=?,basis_updated_receipt_at=?,basis_updated_market_at=? WHERE id=?",
+                                            (decision_now,receipt_at,pnl,decision_now,receipt_at,quote["market_at"],episode_id))
+                                    else:
+                                        db.execute("UPDATE position_episodes SET remaining_basis=?,current_qty=?,realized_pnl=realized_pnl+?,basis_updated_at=?,basis_updated_receipt_at=?,basis_updated_market_at=? WHERE id=?",
+                                            (basis,after_qty,pnl,decision_now,receipt_at,quote["market_at"],episode_id))
                             reason="target_rebalance"
-                            db.execute("INSERT OR IGNORE INTO fills(cohort_id,symbol,strategy,signal_ts,request_at,receipt_at,market_at,side,qty,raw_price,fill_price,fee,slippage,realized_pnl,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                (cohort_id,symbol,account["strategy"],decision["signal_ts"],request_at,receipt_at,quote["market_at"],side,order["quantity"],raw,fill_price,order["fee"],order["slippage"],pnl,reason))
-                            db.execute("UPDATE accounts SET cash=?,qty=?,basis=?,fees=fees+?,slippage=slippage+?,realized_pnl=realized_pnl+?,last_price=?,last_market_at=?,last_receipt_at=?,peak_nlv=?,max_drawdown=max(max_drawdown,?),updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
-                                (order["cash"],after_qty,basis,order["fee"],order["slippage"],pnl,raw,quote["market_at"],receipt_at,peak,dd,receipt_at,cohort_id,symbol,account["strategy"]))
+                            db.execute("INSERT OR IGNORE INTO fills(cohort_id,symbol,strategy,signal_ts,request_at,receipt_at,market_at,side,qty,raw_price,fill_price,fee,slippage,realized_pnl,reason,episode_id,applied_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (cohort_id,symbol,account["strategy"],decision["signal_ts"],request_at,receipt_at,quote["market_at"],side,order["quantity"],raw,fill_price,order["fee"],order["slippage"],pnl,reason,episode_id,decision_now))
+                            if side=="SELL" and after_qty <= 1e-12:
+                                basis=0.0
+                                episode_id=None; position_tp_pct=None; position_sl_pct=None; position_opened_at=None
+                            basis_receipt=receipt_at if side=="BUY" or after_qty > 1e-12 else None
+                            basis_market=quote["market_at"] if side=="BUY" or after_qty > 1e-12 else None
+                            basis_applied=decision_now if side=="BUY" or after_qty > 1e-12 else None
+                            db.execute("UPDATE accounts SET cash=?,qty=?,basis=?,episode_id=?,position_opened_at=?,basis_updated_at=?,basis_updated_receipt_at=?,basis_updated_market_at=?,position_tp_pct=?,position_sl_pct=?,fees=fees+?,slippage=slippage+?,realized_pnl=realized_pnl+?,last_price=?,last_market_at=?,last_receipt_at=?,peak_nlv=?,max_drawdown=max(max_drawdown,?),updated_at=? WHERE cohort_id=? AND symbol=? AND strategy=?",
+                                (order["cash"],after_qty,basis,episode_id,position_opened_at,basis_applied,basis_receipt,basis_market,position_tp_pct,position_sl_pct,order["fee"],order["slippage"],pnl,raw,quote["market_at"],receipt_at,peak,dd,decision_now,cohort_id,symbol,account["strategy"]))
                         db.execute("UPDATE decisions SET status=?,reason=? WHERE id=?", ("filled" if order else "no_trade", "Filled from a new post-decision quote." if order else ("Exit-only session blocked an increase; no fill." if exit_only else "Target already within the 2.5 percentage-point no-trade band; no fill."), decision["id"]))
                         account = db.execute("SELECT * FROM accounts WHERE cohort_id=? AND symbol=? AND strategy=?", (cohort_id,symbol,account["strategy"])).fetchone()
                         equity = float(account["cash"]) + float(account["qty"])*raw
@@ -1119,6 +1617,12 @@ class ForwardCohort:
                 if not remaining:
                     db.execute("UPDATE cohorts SET state='finished',session_status='finished',entry_disabled=1,reason=?,error=NULL WHERE id=?",
                         ("All requested positions exited on fresh quotes; the session is finished.", cohort_id))
+            elif final_cohort["state"] == "protection_pending":
+                remaining = db.execute("SELECT count(*) FROM accounts WHERE cohort_id=? AND exit_requested=1 AND exit_priority BETWEEN ? AND ?",
+                    (cohort_id, EXIT_PRIORITY["take_profit"], EXIT_PRIORITY["account_drawdown"])).fetchone()[0]
+                if not remaining:
+                    db.execute("UPDATE cohorts SET state='paused',close_retry_after=NULL,reason=?,error=NULL WHERE id=? AND state='protection_pending'",
+                        ("The latched protective close filled from a later fresh quote. Signal monitoring remains paused; resume explicitly after reviewing the cooldown.", cohort_id))
             else:
                 active_positions = db.execute("SELECT count(*) FROM accounts WHERE cohort_id=? AND qty>1e-12", (cohort_id,)).fetchone()[0]
                 if not active_positions and final_cohort["session_status"] in {"expired_exit_only", "stopped_exit_only", "clock_suspect"}:
@@ -1128,37 +1632,88 @@ class ForwardCohort:
     def _pause_error(self, cohort_id: str, message: str, generation: int | None = None) -> None:
         observed_now = self._advance_session_clock()
         with self.db() as db:
-            row = db.execute("SELECT state,launch_generation,session_status FROM cohorts WHERE id=?", (cohort_id,)).fetchone()
-            if (row and row["state"] in {"starting", "running", "exiting"} and
+            row = db.execute("SELECT * FROM cohorts WHERE id=?", (cohort_id,)).fetchone()
+            if (row and row["state"] in {"starting", "running", "exiting", "protection_pending"} and
                     (generation is None or int(row["launch_generation"]) == generation)):
                 close_pending = row["session_status"] in {"expired_pending_close", "stopped_pending_close", "clock_suspect"}
-                retry_at = observed_now + self.poll_seconds if close_pending else None
+                protection_pending = db.execute("SELECT count(*) FROM accounts WHERE cohort_id=? AND exit_requested=1 AND exit_priority BETWEEN ? AND ?",
+                    (cohort_id, EXIT_PRIORITY["take_profit"], EXIT_PRIORITY["account_drawdown"])).fetchone()[0] > 0
+                retry_at = observed_now + self.poll_seconds if close_pending or protection_pending else None
                 session_status = "paused" if row["session_status"] == "active" and not close_pending else row["session_status"]
-                db.execute("UPDATE cohorts SET state='paused',session_status=?,reason=?,error=?,close_retry_after=? WHERE id=?",
-                    (session_status, message, message, retry_at, cohort_id))
+                if protection_pending and not close_pending and row["state"] != "exiting":
+                    db.execute("UPDATE cohorts SET state='protection_pending',session_status=?,reason=?,error=?,close_retry_after=? WHERE id=?",
+                        (session_status, message + " Latched closes retry using quotes only; signals stay paused.", message, retry_at, cohort_id))
+                    db.execute("UPDATE decisions SET status='cancelled',reason='Feed unavailable; the latched close remains active and scheduled entries are cancelled.' WHERE cohort_id=? AND status='pending'", (cohort_id,))
+                else:
+                    db.execute("UPDATE cohorts SET state='paused',session_status=?,reason=?,error=?,close_retry_after=? WHERE id=?",
+                        (session_status, message, message, retry_at, cohort_id))
                 if row["session_status"] in {"expired_exit_only", "stopped_exit_only"}:
                     self._cancel_pending_entries_keep_reductions(db, cohort_id,
                         "Public feed error; pending entries/increases were cancelled. A pending reduction remains eligible for a fresh quote.")
-                else:
+                elif not protection_pending:
                     db.execute("UPDATE decisions SET status='cancelled',reason='Public feed error; no catch-up after service recovery.' WHERE cohort_id=? AND status='pending'", (cohort_id,))
 
     def export_csv(self) -> str:
         output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["record_type","cohort_id","cohort_state","session_id","session_started_at_utc","session_deadline_utc","session_duration_minutes","expiry_policy","session_status","entry_disabled","clock_high_water_utc","session_decided_at_utc","terminal_reason","started_at_utc","resume_at_utc","config_sha256","config_json","symbol","strategy","signal_utc","created_or_request_utc","due_or_receipt_utc","provider_market_utc","status_or_side","target_weight","qty","raw_price","fill_price","fee_usd","slippage_usd","realized_pnl_usd","reason"])
+        fields = ["record_type","cohort_id","cohort_state","session_id","session_started_at_utc","session_deadline_utc",
+            "session_duration_minutes","expiry_policy","session_status","entry_disabled","clock_high_water_utc",
+            "session_decided_at_utc","terminal_reason","started_at_utc","resume_at_utc","config_sha256","config_json",
+            "session_config_json","protection_schema_version","symbol","strategy","signal_utc","created_or_request_utc",
+            "due_or_receipt_utc","provider_market_utc","status_or_side","target_weight","qty","raw_price","fill_price",
+            "fee_usd","slippage_usd","realized_pnl_usd","reason","episode_id","opened_at_utc","closed_at_utc",
+            "take_profit_pct","stop_loss_pct","opening_basis_usd","remaining_basis_usd","net_return_pct",
+            "threshold_pct","exit_priority","protection_decided_at_utc","applied_at_utc","basis_applied_at_utc",
+            "close_receipt_at_utc","pending_reason","protection_trigger_reason","detail"]
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
         with self.db() as db:
             cohorts = db.execute("SELECT * FROM cohorts ORDER BY created_at,id").fetchall()
             for cohort in cohorts:
                 cid = cohort["id"]
-                config = cohort["config_json"]
-                meta = [cid, cohort["state"], cohort["session_id"], utc_iso(cohort["session_started_at"]),
-                    utc_iso(cohort["session_deadline_at"]), cohort["session_duration_minutes"], cohort["expiry_policy"],
-                    cohort["session_status"], bool(cohort["entry_disabled"]), utc_iso(cohort["clock_high_water"]),
-                    utc_iso(cohort["session_decided_at"]), cohort["terminal_reason"], utc_iso(cohort["start_at"]),
-                    utc_iso(cohort["resume_at"]), cohort["config_hash"], config]
-                writer.writerow(["cohort", *meta, "", "", "", "", "", "", "", "", "", "", "", "", "", "", cohort["reason"] or ""])
+                meta = {"cohort_id": cid, "cohort_state": cohort["state"], "session_id": cohort["session_id"],
+                    "session_started_at_utc": utc_iso(cohort["session_started_at"]),
+                    "session_deadline_utc": utc_iso(cohort["session_deadline_at"]),
+                    "session_duration_minutes": cohort["session_duration_minutes"], "expiry_policy": cohort["expiry_policy"],
+                    "session_status": cohort["session_status"], "entry_disabled": bool(cohort["entry_disabled"]),
+                    "clock_high_water_utc": utc_iso(cohort["clock_high_water"]),
+                    "session_decided_at_utc": utc_iso(cohort["session_decided_at"]), "terminal_reason": cohort["terminal_reason"],
+                    "started_at_utc": utc_iso(cohort["start_at"]), "resume_at_utc": utc_iso(cohort["resume_at"]),
+                    "config_sha256": cohort["config_hash"], "config_json": cohort["config_json"],
+                    "session_config_json": cohort["session_config_json"],
+                    "protection_schema_version": cohort["protection_schema_version"]}
+                writer.writerow({**meta, "record_type":"cohort", "reason":cohort["reason"] or ""})
                 for row in db.execute("SELECT * FROM decisions WHERE cohort_id=? ORDER BY signal_ts,symbol,strategy", (cid,)):
-                    writer.writerow(["decision", *meta, row["symbol"],row["strategy"],utc_iso(row["signal_ts"]),utc_iso(row["created_at"]),utc_iso(row["due_at"]),"",row["status"],row["target_weight"],"","","","","","",row["reason"]])
+                    writer.writerow({**meta, "record_type":"decision", "symbol":row["symbol"],"strategy":row["strategy"],
+                        "signal_utc":utc_iso(row["signal_ts"]),"created_or_request_utc":utc_iso(row["created_at"]),
+                        "due_or_receipt_utc":utc_iso(row["due_at"]),"status_or_side":row["status"],
+                        "target_weight":row["target_weight"],"reason":row["reason"]})
                 for row in db.execute("SELECT * FROM fills WHERE cohort_id=? ORDER BY id", (cid,)):
-                    writer.writerow(["fill", *meta, row["symbol"],row["strategy"],utc_iso(row["signal_ts"]),utc_iso(row["request_at"]),utc_iso(row["receipt_at"]),utc_iso(row["market_at"]),row["side"],"",row["qty"],row["raw_price"],row["fill_price"],row["fee"],row["slippage"],row["realized_pnl"],row["reason"]])
+                    writer.writerow({**meta, "record_type":"fill", "symbol":row["symbol"],"strategy":row["strategy"],
+                        "signal_utc":utc_iso(row["signal_ts"]),"created_or_request_utc":utc_iso(row["request_at"]),
+                        "due_or_receipt_utc":utc_iso(row["receipt_at"]),"provider_market_utc":utc_iso(row["market_at"]),
+                        "status_or_side":row["side"],"qty":row["qty"],"raw_price":row["raw_price"],
+                        "fill_price":row["fill_price"],"fee_usd":row["fee"],"slippage_usd":row["slippage"],
+                        "realized_pnl_usd":row["realized_pnl"],"reason":row["reason"],"episode_id":row["episode_id"],
+                        "applied_at_utc":utc_iso(row["applied_at"])})
+                for row in db.execute("SELECT * FROM position_episodes WHERE cohort_id=? ORDER BY opened_at,id", (cid,)):
+                    writer.writerow({**meta, "record_type":"position_episode", "symbol":row["symbol"],"strategy":row["strategy"],
+                        "episode_id":row["id"],"opened_at_utc":utc_iso(row["opened_at"]),"closed_at_utc":utc_iso(row["closed_at"]),
+                        "take_profit_pct":row["take_profit_pct"],"stop_loss_pct":row["stop_loss_pct"],
+                        "opening_basis_usd":row["opening_basis"],"remaining_basis_usd":row["remaining_basis"],
+                        "realized_pnl_usd":row["realized_pnl"],"status_or_side":row["status"],
+                        "reason":row["close_reason"] or row["pending_reason"] or "",
+                        "pending_reason":row["pending_reason"] or "",
+                        "protection_trigger_reason":row["protection_trigger_reason"] or "",
+                        "protection_decided_at_utc":utc_iso(row["protection_triggered_at"]),
+                        "applied_at_utc":utc_iso(row["opened_at"]),"basis_applied_at_utc":utc_iso(row["basis_updated_at"]),
+                        "close_receipt_at_utc":utc_iso(row["close_receipt_at"])})
+                for row in db.execute("SELECT * FROM protection_events WHERE cohort_id=? ORDER BY id", (cid,)):
+                    writer.writerow({**meta, "record_type":"protection_event", "symbol":row["symbol"],"strategy":row["strategy"],
+                        "episode_id":row["episode_id"],"status_or_side":row["event_type"],"reason":row["reason"],
+                        "signal_utc":utc_iso(row["decided_at"]),"created_or_request_utc":utc_iso(row["request_at"]),
+                        "due_or_receipt_utc":utc_iso(row["receipt_at"]),"provider_market_utc":utc_iso(row["market_at"]),
+                        "raw_price":row["price"],"net_return_pct":row["net_return_pct"],
+                        "remaining_basis_usd":row["remaining_basis"],"threshold_pct":row["threshold_pct"],
+                        "exit_priority":row["priority"],"protection_decided_at_utc":utc_iso(row["decided_at"]),
+                        "detail":row["detail"]})
         return output.getvalue()

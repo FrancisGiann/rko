@@ -1,32 +1,25 @@
 # RKO
 
-RKO is a local research and paper-simulation dashboard. The source uses Python's standard library, SQLite, and vanilla JavaScript. It contains no exchange-order endpoint, credential entry, leverage, deployment configuration, or real-money execution.
+RKO is a local paper-simulation and historical-research web app using Python's standard library, SQLite, and vanilla JavaScript. This source-only snapshot includes no archived prices, exchange-order path, credentials, leverage, or real-money execution.
 
 ## Run locally
 
-Requires Python 3.10 or later and SQLite. No dependency installation is required.
+Requires Python 3.10+ and SQLite. No dependency installation is needed.
 
 ```sh
 python3 server.py
 ```
 
-Open `http://127.0.0.1:8765/`. Page load reads local state only. It does not download market history, fit a model, or start a paper cohort. The default database is `data/crypto_lab_v5/paper.sqlite3`; those paths are retained for compatibility. Data directories, database files, caches, and research outputs are ignored by `.gitignore`.
+Open `http://127.0.0.1:8765/`. Initial page load reads local state only: it does not fetch market history, start a paper cohort, or evaluate a study. The app may create local SQLite and cache folders; keep them outside version control and use device encryption as appropriate.
 
-The fixed 10% risk halt is an account-level sampled peak-net-liquidation-value drawdown rule, not a per-position stop-loss or guaranteed maximum loss. Price gaps and quote timing can overshoot it.
+The forward cohort is opt-in and paper-only. It uses aggregate USD price observations, separate from Binance USDT historical research. Optional TP/SL is OFF by default. A threshold trigger records a decision and requires a later fresh quote before a simulated sell. The five-minute sampling, service interruptions, provider gaps, modeled costs, and price gaps can produce a worse outcome than the threshold. No execution or maximum-loss guarantee is made. The separate 10% account rule is a sampled peak-net-liquidation drawdown halt, not a per-position stop.
 
-Run the synthetic regression tests with:
+Legacy CoinGecko ML training and refresh are disabled under current API terms. Read [`PUBLIC_GUIDE.md`](PUBLIC_GUIDE.md), [`PUBLIC_DATA_GUIDE.md`](PUBLIC_DATA_GUIDE.md), and [`DATA_LICENSE_NOTICE.md`](DATA_LICENSE_NOTICE.md) before using data workflows.
 
-```sh
-python3 -m unittest discover -v
-node --check app.js
-```
+## Historical panels and rights
 
-## Historical studies and saved results
+The public source ZIP intentionally omits saved V4/V5/Jesse result JSON, fills, ledgers, metric audits, Binance archives, normalized OHLCV, and user databases. Historical panels therefore show unavailable rather than inventing results. V4 can be independently evaluated from a separately obtained checksum-matching cache. Original V5 and Jesse archived comparisons also require their matching saved results, receipts, and time audit; normalized data alone does not recreate those panels.
 
-This public source snapshot intentionally excludes raw Binance archives, normalized OHLCV data, and every saved V4/V5/Jesse score or ledger. The historical result views fail closed and show an unavailable state when compatible local artifacts are absent. V4 can be independently evaluated from a separately obtained, checksum-verified dataset. The original V5 and Jesse archived comparisons pin matching V4 result hashes and also require their compatible score receipts and time-metric audit; normalized data alone cannot recreate those archived panels. The synthetic demo is clearly separate from market evidence.
+No project-wide open-source license is selected by this snapshot. GitHub's terms govern viewing and forking on GitHub; the repository adds no broader code-reuse license. The exact MIT notice under `third_party/jesse/LICENSE` applies only to the referenced upstream Jesse example strategies. Data terms are separate from application-code rights.
 
-Fetching Binance data and evaluating a study are separate explicit commands. Read [`PUBLIC_DATA_GUIDE.md`](PUBLIC_DATA_GUIDE.md) and the current official terms first. The historical workflow is restricted to personal, non-production research under the dataset terms. The app does not fetch or evaluate on page load. CoinGecko aggregate USD prices are reserved for a separate simulated forward price-rule cohort; current CoinGecko terms do not permit AI-model training from its data.
-
-## Rights and notices
-
-No project-wide license is included, so this public repository does not grant permission to reuse the RKO application code. The MIT license in [`third_party/jesse/LICENSE`](third_party/jesse/LICENSE) applies only to the referenced upstream Jesse example strategies. See [`PROJECT_LICENSE_STATUS.md`](PROJECT_LICENSE_STATUS.md) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+The public test report covers source-only synthetic checks. No public screenshot is included: available images contain private historical results or synthetic private QA state.

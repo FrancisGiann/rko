@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light"><meta name="theme-color" content="#f5f4ef">
-  <title>RKO · Paper Research</title><link rel="icon" href="/favicon.svg"><link rel="stylesheet" href="/styles.css"><script src="/app.js" defer></script>
+  <title>RKO · Paper Research</title><link rel="icon" href="/favicon.svg"><link rel="stylesheet" href="/styles.css"><script src="/time_utils.js" defer></script><script src="/app.js" defer></script>
 </head>
 <body>
   <a class="skip" href="#v5-history">Skip to V5 exploratory comparison</a>
@@ -17,8 +17,8 @@
     <div class="safety-line"><span class="tag amber">SIMULATED ONLY</span><span>Research + paper money. Every fill is a simulation.</span><span class="safety-end">NO EXCHANGE ORDERS</span></div>
     <header class="page-head"><div><div class="eyebrow">RESEARCH TERMINAL</div><h1>Test the idea. Keep the evidence.</h1></div><span class="session">SESSION <span id="session-clock">—</span> UTC</span></header>
     <section id="v5-history" class="v5-section" aria-labelledby="v5-history-title">
-      <div class="section-heading"><div><div class="eyebrow">V5 / EXPLORATORY REUSE</div><h2 id="v5-history-title">Compare fixed risk-managed rules.</h2></div><span class="tag quiet">7 RULES · 3 COSTS</span></div>
-      <p class="v5-lede">The source includes a frozen V5 protocol, but no historical market data or result bundle. This comparison stays unavailable until compatible, locally supplied artifacts pass checksum and provenance checks. It does not claim a fresh holdout or prospective result.</p>
+      <div class="section-heading"><div><div class="eyebrow">V5 / EXPLORATORY REUSE</div><h2 id="v5-history-title">Compare fixed risk-managed rules.</h2></div><span class="tag quiet">210 CELLS · 7 RULES · 3 COSTS</span></div>
+      <p class="v5-lede">Every 2022–2026 market period below was already inspected in V4. This is exploratory reuse, not a fresh holdout or prospective result. All candidates share the same sizing, 10% drawdown halt, timing and cost assumptions; no winner was selected.</p>
       <div class="v5-warning">A lower drawdown caused by smaller or shorter exposure is risk management, not predictive alpha. Fee and slippage scenarios are modeled assumptions; these are not executable returns.</div>
       <div class="v5-source-line"><span id="v5-study-status">Loading saved, checksum-verified V5 summary…</span><button class="text-button" id="v5-refresh">Refresh summary</button></div>
       <div class="v5-controls">
@@ -37,8 +37,10 @@
         </div>
       </details>
       <div class="v5-context">
-        <h3>Saved historical comparison</h3>
-        <p id="v5-v4-context">No result previews are included in this public source snapshot. V4, V5, and Jesse summaries remain unavailable until a user separately supplies compatible, licensed local data and verified saved outputs.</p>
+        <h3>Frozen V4 signal under the common risk manager</h3>
+        <p id="v5-v4-context">The 2026 common-risk replay still lost money. Changed sizing and timing reduced per-entry weights and altered exposure paths; this does not improve the model's predictive evidence. The V4 probabilities remain unchanged.</p>
+        <div class="v5-context-grid"><span>BTC / USDT</span><strong>−4.84% net · 6.06% max DD · 1.88% mean exposure</strong><span>ETH / USDT</span><strong>−2.41% net · 3.01% max DD · 0.44% mean exposure</strong></div>
+        <p>Original V4 model returns were −11.31% BTC and −10.72% ETH. First-entry target weights fell from 49.96% to 24.77% BTC and 13.52% ETH. The smaller losses occurred under changed risk rules and exposure paths; they are not evidence the same signal predicts better.</p>
       </div>
       <div class="v5-plan-note"><h3>Prospective plan status</h3><p>No new plan is active. Any proposed study requires a separately frozen protocol and source/license review before historical scoring; it cannot arm the USD paper cohort.</p></div>
       <details class="v5-provenance"><summary>Protocol, dataset hashes and saved-result provenance</summary><dl id="v5-provenance-list"></dl></details>
@@ -49,6 +51,7 @@
       <p class="v5-lede">This isolated BTC/ETH comparison uses daily aggregate USD observations and current CoinGecko USD quotes. Binance USDT models and history never enter these accounts. The service remains stopped until you start it; historical warmup is inputs only.</p>
       <div class="forward-warning">There is no forward evidence yet. Starting cash is not a result. A start after today's 00:00 UTC point uses that point only as a baseline; the first eligible decision needs a strictly later completed daily point and a fresh 04:00 UTC quote. That decision expires at 04:15 UTC. No historical signal is backfilled.</div>
       <div class="forward-status" role="status" aria-live="polite"><strong id="forward-state">Checking isolated forward cohort…</strong><span id="forward-message">No fetch or paper job starts on page load.</span><span id="forward-timing">Waiting for status…</span><button class="text-button" id="forward-retry" hidden>Retry status check</button></div>
+      <p class="forward-qa-banner" id="forward-qa-fixture" role="note" hidden></p>
       <div class="forward-timer" aria-label="Paper session timer and daily signal schedule">
         <div><span>Session time remaining</span><strong id="forward-countdown">Not started</strong></div>
         <div><span>Accepted by server · UTC</span><strong id="forward-accepted">—</strong></div>
@@ -65,8 +68,16 @@
         <label for="forward-expiry-policy">When the timer ends
           <select id="forward-expiry-policy"><option value="CLOSE" selected>Close positions at a fresh quote</option><option value="EXIT_ONLY">Exit-only · no new or larger positions</option></select>
         </label>
+        <label for="forward-take-profit">Take profit · net position % · optional
+          <input id="forward-take-profit" type="number" min="0.1" max="100" step="0.1" placeholder="OFF" inputmode="decimal">
+        </label>
+        <label for="forward-stop-loss">Stop loss · net position % · optional
+          <input id="forward-stop-loss" type="number" min="0.1" max="99.9" step="0.1" placeholder="OFF" inputmode="decimal">
+        </label>
         <p>Duration limits new entries. Signals still use completed daily 00:00 UTC observations and a fresh 04:00 UTC fill. A position can span multiple days; no timer setting changes signal cadence.</p>
+        <p class="forward-protection-note">Optional thresholds apply to each position's remaining net liquidation return after modeled entry costs and estimated exit costs (25 bps fee + 10 bps slippage per side). They latch a fresh-quote close; they are not guaranteed prices or maximum-loss guarantees. A small stop can trigger from round-trip costs even when the raw quote is unchanged. Leave both blank for protection OFF.</p>
       </div>
+      <p class="forward-protection-summary" id="forward-protection-summary">Position TP/SL: OFF · applies only to positions opened under a confirmed session.</p>
       <div class="forward-controls">
         <button class="button primary" id="forward-start" hidden>Review and start</button>
         <button class="button subtle" id="forward-pause" hidden>Pause · keep positions</button>
@@ -79,17 +90,30 @@
       <dialog id="forward-start-dialog" aria-labelledby="forward-start-title">
         <h2 id="forward-start-title">Review your paper session</h2>
         <p id="forward-start-copy">Review the timer and expiry behavior before the server starts a session.</p>
-        <dl class="forward-review-list"><dt>Duration</dt><dd id="forward-review-duration">—</dd><dt>Expiry policy</dt><dd id="forward-review-policy">—</dd><dt>Expected server acceptance</dt><dd id="forward-review-start">—</dd><dt>Expected deadline · UTC</dt><dd id="forward-review-deadline">—</dd><dt>Next daily fill window · UTC</dt><dd id="forward-review-window">—</dd></dl>
+        <dl class="forward-review-list"><dt>Duration</dt><dd id="forward-review-duration">—</dd><dt>Expiry policy</dt><dd id="forward-review-policy">—</dd><dt>Position TP / SL</dt><dd id="forward-review-protection">—</dd><dt>Basis and modeled costs</dt><dd>Remaining-lot net liquidation, including modeled entry and estimated exit costs · 25 bps fee + 10 bps slippage per side</dd><dt>Expected server acceptance</dt><dd id="forward-review-start">—</dd><dt>Expected deadline · UTC</dt><dd id="forward-review-deadline">—</dd><dt>Next daily fill window · UTC</dt><dd id="forward-review-window">—</dd></dl>
         <p id="forward-zero-signal-warning" class="forward-zero-warning"></p>
         <p>Forward decisions still use completed daily 00:00 UTC aggregate-price observations, then a fresh 04:00 UTC quote. Warmup is input-only. The timer includes warmup; a short session can finish with zero signals.</p>
         <form method="dialog"><button class="button subtle" value="cancel" autofocus>Change session</button><button class="button primary" id="forward-confirm-start" value="confirm">Confirm and start</button></form>
       </dialog>
       <p class="forward-disclaimer" id="forward-disclaimer">Not started · 0 forward observation days · no performance claim. A fresh quote batch is requested every five minutes only while the cohort is active. CoinGecko public API access and terms may change.</p>
+      <p class="forward-qa-banner" id="forward-qa-fixture-accounts" role="note" hidden></p>
+      <p class="forward-table-hint">Wide account audit table · focus this region and use the arrow keys, or swipe sideways, to review all 14 values.</p>
       <div class="v5-table-wrap forward-account-wrap" tabindex="0" role="region" aria-label="Forward simulated accounts by asset and fixed strategy">
-        <table class="v5-table"><caption>Separate 10,000 USD cash accounts; a row becomes performance evidence only after a post-start observation</caption><thead><tr><th>Asset</th><th>Strategy</th><th>Account state</th><th>Net liquidation</th><th>Return</th><th>Drawdown</th><th>Exposure</th><th>Fees + slippage</th></tr></thead><tbody id="forward-account-body"><tr><td colspan="8" class="empty-cell">Not started. No accounts are trading.</td></tr></tbody></table>
+          <table class="v5-table"><caption>Separate 10,000 USD cash accounts; returns use observed marks and estimated liquidation costs</caption><thead><tr><th>Asset</th><th>Strategy</th><th>Account state</th><th>Quantity</th><th>Remaining basis</th><th>Net liquidation · est.</th><th>Marked return</th><th>Net-liquidation return · est.</th><th>Position net return · last quote</th><th>TP / SL raw price estimates</th><th>Last quote · UTC / age</th><th>Drawdown</th><th>Exposure</th><th>Fees + slippage</th></tr></thead><tbody id="forward-account-body"><tr><td colspan="14" class="empty-cell">Not started. No accounts exist and no performance is reported.</td></tr></tbody></table>
       </div>
       <div id="forward-mobile-accounts" class="forward-mobile-accounts" role="list" aria-label="Forward paper accounts; open each row for balance and cost details"></div>
+      <details class="forward-audit"><summary>Recent position episodes and TP/SL decisions <span id="forward-protection-history-count">0 records</span></summary>
+        <p class="forward-qa-banner" id="forward-qa-fixture-episodes" role="note" hidden></p>
+        <p class="forward-history-note">Episode rows preserve total entry cost, remaining basis and net realized P&amp;L after modeled costs. Decision rows retain trigger quote, net return, basis, threshold and actual server decision time. These are simulated records, not guaranteed execution prices.</p>
+        <div class="v5-table-wrap" tabindex="0" role="region" aria-label="Recent paper position episodes and realized costs; scroll horizontally for all columns">
+          <table class="v5-table"><thead><tr><th>Asset / strategy</th><th>Opened · UTC</th><th>Closed · UTC</th><th>State / close reason</th><th>Session TP / SL</th><th>Total entry cost</th><th>Remaining basis</th><th>Net realized P&amp;L</th><th>Fees</th><th>Slippage</th><th>Protection trigger</th></tr></thead><tbody id="forward-episode-body"><tr><td colspan="11" class="empty-cell">No position episodes.</td></tr></tbody></table>
+        </div>
+        <div class="v5-table-wrap" tabindex="0" role="region" aria-label="Recent protective decisions and later fills; scroll horizontally for all columns">
+          <table class="v5-table"><thead><tr><th>Asset / strategy</th><th>Event</th><th>Reason / priority</th><th>Decision · UTC</th><th>Quote price</th><th>Net return at decision</th><th>Remaining basis</th><th>Threshold</th><th>Detail</th></tr></thead><tbody id="forward-protection-body"><tr><td colspan="9" class="empty-cell">No TP/SL decisions.</td></tr></tbody></table>
+        </div>
+      </details>
       <details class="forward-audit"><summary>Recent decisions and fills <span id="forward-ledger-count">0 records</span></summary>
+        <p class="forward-qa-banner" id="forward-qa-fixture-ledger" role="note" hidden></p>
         <div class="v5-table-wrap" tabindex="0" role="region" aria-label="Recent forward cohort decisions and simulated fills">
           <table class="v5-table"><thead><tr><th>Record</th><th>Asset / strategy</th><th>UTC</th><th>Status / side</th><th>Target / quantity</th><th>Reason</th></tr></thead><tbody id="forward-ledger-body"><tr><td colspan="6" class="empty-cell">No forward records.</td></tr></tbody></table>
         </div>
@@ -137,7 +161,7 @@
     </section>
     <section id="research" class="research" aria-labelledby="research-title" aria-busy="true">
       <div class="section-heading"><div><div class="eyebrow">SEPARATE LEGACY PAPER WORKFLOW</div><h2>30-day aggregate USD pilot</h2></div><span class="tag quiet">COINGECKO · USD</span></div>
-      <p class="legacy-history-note">This legacy panel only displays locally available snapshots and a clearly labeled synthetic demo. Any historical snapshot is retrospective, not prospective evidence.</p>
+      <p class="legacy-history-note">The earlier V3 October 2026 holdout (142 observations per symbol) was already examined. This rolling retrospective pilot is not an untouched or prospective test.</p>
       <section class="toolbar" aria-label="30-day USD pilot controls">
         <div class="mode-control" role="group" aria-label="Data mode"><button id="mode-live" aria-pressed="true">Public data</button><button id="mode-demo" aria-pressed="false">Seeded demo</button></div>
         <label class="symbol-label" for="symbol">Market<select id="symbol"><option value="BTC-USD">BTC / USD</option><option value="ETH-USD">ETH / USD</option></select></label>

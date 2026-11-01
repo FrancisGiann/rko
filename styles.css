@@ -302,6 +302,7 @@ dialog form{flex-wrap:wrap}
 .v5-paired>p{font-size:14px;line-height:1.6}
 .v5-paired summary span,.forward-audit summary span{font:13px/1.5 var(--sans);color:var(--subtle)}
 .v5-context,.v5-plan-note,.forward-status,.v4-job,.v4-uncertainty{background:#eeefea;border:1px solid var(--line);border-radius:4px}
+.forward-qa-banner:not([hidden]){margin:10px 0;padding:12px 14px;border-radius:4px;background:#f2e8d7;color:#4b3d29;font-size:14px;font-weight:650;line-height:1.5}
 .v5-context{padding:18px 0;border-width:1px 0}
 .v5-context h3,.v5-plan-note h3{font-size:17px}
 .v5-context p,.v5-plan-note p{font-size:14px;line-height:1.65;color:var(--muted)}
@@ -323,6 +324,8 @@ dialog form{flex-wrap:wrap}
 .forward-session-options label{display:grid;gap:6px;font-size:14px;color:var(--muted)}
 .forward-session-options input,.forward-session-options select{width:100%}
 .forward-session-options p{grid-column:1/-1;color:var(--subtle);font-size:14px;line-height:1.55}
+.forward-protection-note{max-width:78ch}
+.forward-protection-summary{font-size:14px;line-height:1.55;color:var(--muted);overflow-wrap:anywhere}
 .forward-controls{gap:10px;margin:12px 0}
 .forward-controls .button{min-width:165px;font-size:14px}
 .forward-review-list{display:grid;grid-template-columns:minmax(130px,.8fr) minmax(0,1.2fr);gap:8px 14px;font-size:14px}
@@ -331,9 +334,14 @@ dialog form{flex-wrap:wrap}
 .forward-zero-warning{padding:10px 12px;border:1px solid #dfd6bd;border-radius:4px;background:#f2efe5;color:#55451e}
 .forward-account-wrap{min-width:0}
 .forward-account-wrap .v5-table{min-width:900px}
+.forward-table-hint{margin:5px 0 8px;color:var(--muted);font-size:13px;line-height:1.5}
 .forward-audit .v5-table{min-width:800px}
 .forward-mobile-accounts,.v5-mobile-results{display:none}
 .forward-disclaimer{padding:11px 0;border-top:1px solid var(--line)}
+.forward-episode-history{margin:4px 0 0;padding-left:20px;color:var(--muted);font-size:13px;line-height:1.5}
+.forward-episode-history li{margin:5px 0;overflow-wrap:anywhere}
+.forward-history-title{margin:10px 0 4px;font-size:13px;font-weight:620;color:var(--text)}
+.forward-history-note{max-width:78ch;color:var(--muted);font-size:14px;line-height:1.55}
 .v4-source-strip{font:14px/1.5 var(--sans)}
 .v4-controls-note,.v4-job p,.v4-empty,.v4-results-head h3,.v4-result-controls label,.v4-chart-caption,.v4-subgrid section>p,.v4-facts>div,.v4-uncertainty,.v4-diagnostics>div,.v4-license{font-size:14px;line-height:1.6;color:var(--muted)}
 .v4-job-line{font:14px/1.5 var(--sans);color:var(--muted)}
@@ -364,6 +372,7 @@ dialog form{flex-wrap:wrap}
   .research-grid{display:flex;flex-direction:column}
   .evidence-panel{border-left:0;border-top:1px solid var(--line);padding:18px 0 0}
   .v5-primary-wrap,.forward-account-wrap{display:none}
+  .forward-table-hint{display:none}
   .v5-mobile-results,.forward-mobile-accounts{display:block;width:100%;min-width:0}
   .v5-mobile-row,.forward-mobile-row{padding:15px 0;border-bottom:1px solid var(--line);min-width:0}
   .v5-mobile-row h3,.forward-mobile-row h3{font-size:16px;line-height:1.4;margin-bottom:8px}

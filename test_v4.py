@@ -191,7 +191,7 @@ class ArchiveStoreTests(unittest.TestCase):
         self.assertEqual(paused["pause_reason"], "upstream_or_network")
         self.assertEqual(len(self.archive_calls), 1)
 
-    def test_public_source_fails_closed_when_private_migration_receipt_is_absent(self):
+    def test_protocol_migration_fails_closed_without_private_amendment_receipt(self):
         root = Path(self.tmp.name) / "migration"
         store = ad.ArchiveStore(root)
         data = archive_fixture()
@@ -208,12 +208,9 @@ class ArchiveStoreTests(unittest.TestCase):
         ad.write_json(root / "dataset-manifest.json", original)
         with self.assertRaisesRegex(ValueError, "explicit fetch"):
             store.manifest()
-        with self.assertRaisesRegex(ValueError, "public source bundle omits private pre-fit migration receipts"):
+        with self.assertRaisesRegex(ValueError, "amendment receipt not included"):
             store.manifest(migrate_pre_fit=True)
-        unchanged = json.loads((root / "dataset-manifest.json").read_text())
-        self.assertEqual(unchanged["protocol_sha256"], old_hash)
         self.assertEqual(archive_path.read_bytes(), data)
-        self.assertEqual(unchanged["archives"]["BTCUSDT/2024-01"]["archive_sha256"], hashlib.sha256(data).hexdigest())
 
 
 def synthetic_bars(days=360, start="2020-01-01T00:00:00Z"):

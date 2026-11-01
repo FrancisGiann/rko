@@ -697,22 +697,38 @@ class ForwardCohortTests(unittest.TestCase):
         self.assertEqual(qty, 1.0)
         with self.service.db() as db:
             db.execute("UPDATE cohorts SET state='running' WHERE id=?", (cid,))
-        self.service.control("exit")
-        self.assertEqual(self.service.state()["state"], "exiting")
-        decision = now
-        same_quote = self._quote_batch(decision, request=decision, receipt=decision + .1, market=decision,
-            btc_price=1000.0, eth_price=10.0)
-        self.service._process_quote_batch(cid, same_quote, decision + .1)
-        with self.service.db() as db:
-            self.assertEqual(db.execute("SELECT count(*) FROM fills WHERE side='SELL'").fetchone()[0], 0)
-        fresh = self._quote_batch(decision + 2, request=decision + 2, receipt=decision + 3, market=decision + 2.5,
-            btc_price=1000.0, eth_price=10.0)
-        self.service._process_quote_batch(cid, fresh, decision + 3)
-        self.assertEqual(self.service.state()["state"], "finished")
+        entered, release = threading.Event(), threading.Event()
+        original_fetch = self.service.fetch_quotes
+        def blocked_quotes():
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError("close-worker fixture quote gate timed out")
+            return original_fetch()
+        self.service.fetch_quotes = blocked_quotes
+        try:
+            self.service.control("exit")
+            self.assertTrue(entered.wait(1), "serialized close worker did not enter its quote request")
+            self.assertEqual(self.service.state()["state"], "exiting")
+            decision = now
+            same_quote = self._quote_batch(decision, request=decision, receipt=decision + .1, market=decision,
+                btc_price=1000.0, eth_price=10.0)
+            self.service._process_quote_batch(cid, same_quote, decision + .1)
+            with self.service.db() as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM fills WHERE side='SELL'").fetchone()[0], 0)
+            fresh = self._quote_batch(decision + 2, request=decision + 2, receipt=decision + 3, market=decision + 2.5,
+                btc_price=1000.0, eth_price=10.0)
+            self.service._process_quote_batch(cid, fresh, decision + 3)
+            self.assertEqual(self.service.state()["state"], "finished")
+        finally:
+            release.set()
+            worker = self.service.worker
+            if worker and worker.is_alive():
+                worker.join(timeout=2)
+        self.assertEqual(self.service.state()["state"], "finished", "a stale blocked worker must not revive a closed cohort")
         with self.service.db() as db:
             self.assertEqual(db.execute("SELECT qty FROM accounts WHERE cohort_id=? AND symbol='BTC-USD' AND strategy='passive'", (cid,)).fetchone()[0], 0)
             row = db.execute("SELECT reason FROM fills WHERE side='SELL'").fetchone()
-        self.assertEqual(row[0], "fresh_quote_safety_exit")
+        self.assertEqual(row[0], "manual_close")
 
     def test_paused_history_error_can_exit_by_fresh_quote_without_history(self):
         now = self.now()
