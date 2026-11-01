@@ -1,0 +1,232 @@
+{
+  "candidates": [
+    {
+      "id": "cash",
+      "role": "reference",
+      "rule": "Desired weight 0 at every decision."
+    },
+    {
+      "id": "passive",
+      "role": "common-risk reference",
+      "rule": "Always-active long-only exposure using the common volatility target and common execution manager."
+    },
+    {
+      "id": "jesse_donchian20_sma200_long_cash",
+      "role": "source-derived exploratory candidate",
+      "rule": "At each completed 4h bar close C, compare against the maximum high and minimum low of the previous 20 completed bars, excluding the current bar. SMA200 is the mean of the 200 completed closes including C. When flat, enter long only if C is strictly above both the previous-20 high maximum and SMA200. When long, exit only if C is strictly below the previous-20 low minimum. SMA200 is an entry filter only. Strict equality does not create an entry or exit; existing state holds. A valid 20-bar exit may trigger even when the SMA200 window is incomplete; an incomplete SMA200 blocks entry."
+    },
+    {
+      "id": "jesse_sma50_200_long_cash",
+      "role": "source-derived exploratory candidate",
+      "rule": "At each completed 4h close, compare SMA50 and SMA200, each including the current completed close. Strict SMA50>SMA200 enters or retains long; strict SMA50<SMA200 exits to cash. Equality leaves an existing long open and a flat account flat. Short positions and source-framework sizing are removed."
+    }
+  ],
+  "common_risk_manager": {
+    "active_target_weight": "min(0.50, 0.10 / max(annualized_volatility, 0.10)); cash target is zero.",
+    "drawdown_halt": {
+      "cadence": "Every valid 4h execution/mark open, before processing a pending signal.",
+      "gaps": "A missing/zero-volume open is not an observation or fill. The next valid observed open may overshoot the threshold.",
+      "method": "Compare net liquidation at the observed open, including estimated fee and slippage to liquidate, against the prior running NLV peak; a halt exits at that observed open and remains in cash through that cell.",
+      "threshold_nlv_peak_to_trough": 0.1
+    },
+    "fold_accounts": "Each cell resets to 10,000 USDT. Fold returns are independent and are not compounded across years.",
+    "initial_capital_usdt_per_cell": 10000,
+    "leverage": false,
+    "long_only": true,
+    "maximum_post_trade_marked_asset_weight": 0.5,
+    "rebalance_band_absolute_weight": 0.025,
+    "rebalance_exceptions": [
+      "Always flatten a zero target.",
+      "Always trim a post-marked weight above 50%, including when the current target window is invalid."
+    ],
+    "sizing": "Use the V5 exact post-cost long-only solver. Fees/slippage are applied to executed notional. Cash cannot become negative; no leverage.",
+    "target_annualized_volatility": 0.1,
+    "volatility_floor_annualized": 0.1,
+    "volatility_window": "population standard deviation of 20 previous completed UTC daily returns, annualized with sqrt(365)"
+  },
+  "decision_and_execution": {
+    "bar_interval_seconds": 14400,
+    "daily_volatility": "At each 4h decision, use the most recent fully completed UTC daily close available before that decision and the previous 20 close-to-close returns (21 contiguous complete daily closes). A missing day invalidates the volatility target; no forward fill.",
+    "decision_boundary": "At 4h boundary d, use only bars with open timestamp <= d-4h; the latest included candle is fully completed at d.",
+    "missing_data": "Never fill or compress missing bars. Missing/zero-trade-volume execution opens do not mark or fill; pending entries expire at that scheduled open. Existing holdings carry to the next valid observed open. A fixed calendar final liquidation open that is missing or has zero volume makes that cell incomplete; the endpoint is never moved.",
+    "planned_fill": "Apply the decision only at the next later scheduled observed open d+4h, a full 4h latency. The same decision, execution, mark, risk-check, and rebalance clock applies to all four arms (the two Jesse rules and both cash/passive controls).",
+    "signal_state": "Entry/exit conditions are common across cost scenarios. State transitions use the actual held position; a missed entry does not create a virtual holding and cannot revive an expired breakout."
+  },
+  "grid": {
+    "all_cells_required": true,
+    "assets": 2,
+    "candidate_order": [
+      "cash",
+      "passive",
+      "jesse_donchian20_sma200_long_cash",
+      "jesse_sma50_200_long_cash"
+    ],
+    "cost_scenarios": 3,
+    "cost_scenarios_bps_per_side": [
+      {
+        "fee": 10,
+        "id": "base",
+        "slippage": 5,
+        "total": 15
+      },
+      {
+        "fee": 25,
+        "id": "higher",
+        "slippage": 10,
+        "total": 35
+      },
+      {
+        "fee": 50,
+        "id": "stress",
+        "slippage": 25,
+        "total": 75
+      }
+    ],
+    "expected_attempted_cells": 120,
+    "folds": 5,
+    "result_order": "candidate, symbol, fold (2022,2023,2024,2025,final_2026), cost (base,higher,stress)",
+    "signals_frozen_across_cost_scenarios": true
+  },
+  "historical": {
+    "all_periods_previously_inspected": true,
+    "calendar": "Reuse the exact five already-inspected V4 test windows (2022, 2023, 2024, 2025, and January-September 2026). No fresh or untouched holdout claim.",
+    "datasets": {
+      "BTCUSDT": {
+        "canonical_sha256": "488935ed5705437818defc3753322d8c0778a4d51b5e3c69d41602f04989b4d7",
+        "expected_calendar_slots": 15342,
+        "rejected_partial_rows": 10,
+        "rows": 15331
+      },
+      "ETHUSDT": {
+        "canonical_sha256": "904af044eb508f9a7322115c976c0ed5767ab552ab33eff05a8817ce45c53e23",
+        "expected_calendar_slots": 15342,
+        "rejected_partial_rows": 10,
+        "rows": 15331
+      }
+    },
+    "folds": [
+      {
+        "end_exclusive_utc": "2023-01-01T00:00:00Z",
+        "fixed_final_liquidation_open_utc": "2022-12-31T20:00:00Z",
+        "name": "2022",
+        "test_start_utc": "2022-01-01T00:00:00Z"
+      },
+      {
+        "end_exclusive_utc": "2024-01-01T00:00:00Z",
+        "fixed_final_liquidation_open_utc": "2023-12-31T20:00:00Z",
+        "name": "2023",
+        "test_start_utc": "2023-01-01T00:00:00Z"
+      },
+      {
+        "end_exclusive_utc": "2025-01-01T00:00:00Z",
+        "fixed_final_liquidation_open_utc": "2024-12-31T20:00:00Z",
+        "name": "2024",
+        "test_start_utc": "2024-01-01T00:00:00Z"
+      },
+      {
+        "end_exclusive_utc": "2026-01-01T00:00:00Z",
+        "fixed_final_liquidation_open_utc": "2025-12-31T20:00:00Z",
+        "name": "2025",
+        "test_start_utc": "2025-01-01T00:00:00Z"
+      },
+      {
+        "end_exclusive_utc": "2026-10-01T00:00:00Z",
+        "fixed_final_liquidation_open_utc": "2026-09-30T20:00:00Z",
+        "name": "final_2026",
+        "test_start_utc": "2026-01-01T00:00:00Z"
+      }
+    ],
+    "quote_asset": "USDT",
+    "source": "Official Binance spot monthly 4h klines, locally cached and canonicalized by V4; this study performs no network fetch.",
+    "symbols": [
+      "BTCUSDT",
+      "ETHUSDT"
+    ],
+    "v4_reference": {
+      "first_test_consumed_at_utc": "2026-10-31T19:45:13.671142Z",
+      "protocol_sha256": "7f6b05b6edd89ada8dcda0fdd54e2bef702b9a0d8eeea02a8ed8e24bd31f140d",
+      "result_sha256": "2c1fcbc284d32e0abd3dc649a978a016e8a25283317cd8aaabc3a549e9ddae67",
+      "study_id": "v4-136531a33340c75d6cdf"
+    }
+  },
+  "lead_screen": {
+    "candidate_cell_scope": "The max drawdown criterion applies to each candidate's own 30 cells; passive-control drawdown is reported separately.",
+    "criteria": [
+      "All 120 unique candidate×asset×fold×cost cells complete; no missing/duplicate cells.",
+      "At 35 total bps per side, both assets have positive net return in at least 3 of their 5 independent fold accounts.",
+      "At 75 total bps per side, the sum of net USDT across the five separate 10,000-USDT fold accounts is positive for each asset; this is not compounding or an annual return.",
+      "For each asset, median paired net-return difference versus the same-clock passive control across five folds is nonnegative at 35 total bps per side.",
+      "Maximum drawdown across that candidate's own 30 cells is at most 15%; report passive controls separately.",
+      "At 35 total bps per side, at least 20 round trips occur per asset across five folds and at least one occurs in the final 2026 fold for each asset."
+    ],
+    "pass_interpretation": "A pass could only motivate a separately reviewed forward paper lead. It is not validated edge, a recommendation, or permission to activate.",
+    "purpose": "Predeclared descriptive screen only; cannot validate alpha or auto-start a paper cohort."
+  },
+  "licensing": {
+    "market_data": "Binance data and derived results remain subject to the official Binance Vision terms: CC BY-NC-SA 4.0, personal non-production historical research only, attribution required. No commercial or live execution use.",
+    "no_cross_source": "This USDT historical study cannot be mixed into or used to activate the separate CoinGecko USD forward cohort.",
+    "terms_sha256": "99c4921dbe023cd68c1a447775707d621453cc78aec6ac0bfe2e6c06a5114ee0",
+    "terms_url": "https://github.com/binance/binance-public-data/blob/master/TERMS_AND_CONDITIONS.md",
+    "terms_verified_at_utc": "2026-10-31T19:00:00Z"
+  },
+  "no_new_libraries_training_or_network_fetch": true,
+  "protocol_id": "crypto-lab-jesse-source-derived-4h-exploration",
+  "purpose": "A fixed, bounded exploratory comparison of two source-derived long/cash price rules on cached Binance spot 4h BTCUSDT and ETHUSDT OHLCV. It is not a profit claim, investment advice, or a prospective test.",
+  "required_metrics": [
+    "net return and ending USDT",
+    "maximum net-liquidation drawdown",
+    "fills, entries, round trips, turnover",
+    "fees and slippage",
+    "time in market and average/max post-trade capital exposure",
+    "pre-trade sampled weight, cap trims, and drawdown halt date",
+    "decision-window invalidity and active signals after halt",
+    "expected/observed/missing/zero-volume execution-open coverage",
+    "fixed final liquidation open and cell completeness",
+    "paired return, drawdown, and exposure differences versus same-clock cash and passive controls"
+  ],
+  "resource_gate": {
+    "max_peak_rss_mb": 200,
+    "max_process_cpu_seconds": 10,
+    "synthetic_only_benchmark_before_real_scoring": true,
+    "worker": "single worker, nice 19"
+  },
+  "scope": "exploratory_reuse_of_inspected_history_only",
+  "source_provenance": {
+    "adaptation": "Only mathematical rules were independently implemented in this project. The Jesse framework, upstream source files, and third-party indicators are not installed, imported, or executed. Full MIT notice retained in third_party/jesse/LICENSE.",
+    "commit": "7c91e0a37bf62165790120d730442e4f6eb00364",
+    "commit_date": "2024-03-21T10:22:48Z",
+    "copyright": "Copyright (c) 2020 jesse-ai",
+    "license": "MIT",
+    "license_file_sha256": "80d873148413a3eb2f96bbe22657bf57ae42046e4d95e81852109c5f3a949d2d",
+    "repository": "https://github.com/jesse-ai/example-strategies",
+    "source_rules": {
+      "donchian": {
+        "credited_author": "gabrielweich/jesse-strategies",
+        "path": "Donchian/__init__.py",
+        "sha256": "fc635b257ad1e12951dc140dae46a63bd37e9abfa5f2d681ef1e754d8ce393fe"
+      },
+      "donchian_indicator_default": {
+        "commit": "aded4b9d51d432d411a8f7fbf45e47572dff6629",
+        "default_period": 20,
+        "path": "jesse/indicators/donchian.py",
+        "repository": "https://github.com/jesse-ai/jesse",
+        "sha256": "b7e96ebe3ba476c771a65b353c269a84d02e04587f0d76166c5f322bbbb3a401",
+        "uses": "maximum prior high and minimum prior low"
+      },
+      "sma_crossover": {
+        "credited_author": "Fengkie J.",
+        "path": "SMACrossover/__init__.py",
+        "sha256": "453440d7b934c494934a1c56b3826d94638594f79ad4e4c7faaff36b96d33fae"
+      }
+    }
+  },
+  "state": "frozen_before_historical_candidate_scoring",
+  "trial_ledger": {
+    "initial_bytes": 0,
+    "initial_state": "empty file",
+    "path": "research_data/jesse/trial-ledger.jsonl",
+    "policy": "Append a study_started event before any score and one immutable outcome record for each of the 120 attempted cells, including failures. Any failed/partial score attempt consumes the ledger and requires root review before any further action."
+  },
+  "uncertainty": "Report all cells and deterministic paired comparisons. No bootstrap, search, fitting, parameter sweep, outcome-driven code change, winner badge, or selection of an investment strategy.",
+  "version": 1
+}

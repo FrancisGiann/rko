@@ -1,0 +1,20 @@
+{
+  "cohort_rules": [
+    "A daily observation timestamp less than or equal to max(start_at, resume_at) is warmup-only.",
+    "Only a strictly later source observation received before its 04:00 execution deadline can create a scheduled decision.",
+    "Scheduled entry expires at 04:15 UTC and is never revived by a later quote.",
+    "Historical Binance USDT study protocol and result are unchanged."
+  ],
+  "created_at_utc": "2026-11-01T01:20:27Z",
+  "reason": "Bound daily public-history requests while allowing for delayed publication of the completed 00:00 UTC point.",
+  "scheduled_history_refresh": {
+    "after_budget_or_deadline": "Record the missed observation/deadline and wait for the next UTC day; never backfill.",
+    "earliest_utc": "00:10",
+    "latest_utc_exclusive": "04:00",
+    "manual_start_or_resume_baseline_fetches_are_separate": true,
+    "maximum_btc_eth_pairs_per_utc_day": 3,
+    "minimum_seconds_between_pairs": 300
+  },
+  "scope": "prospective CoinGecko aggregate USD forward cohort only",
+  "state": "pre_performance_collection_forward_policy"
+}

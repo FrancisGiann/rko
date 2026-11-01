@@ -1,0 +1,229 @@
+{
+  "excluded": [
+    "raw Binance archives",
+    "normalized OHLCV datasets",
+    "all saved study result JSON and checksums",
+    "trial ledgers",
+    "fills and derived result CSVs",
+    "metric-audit JSON/CSVs",
+    "score/freeze/approval receipts",
+    "SQLite databases and WAL files",
+    "CoinGecko full terms text",
+    "screenshots and browser evidence",
+    "personal QA logs and delivery receipts",
+    "runtime caches and bytecode",
+    "credentials and secrets",
+    "nested source bundles",
+    ".git history"
+  ],
+  "files": [
+    {
+      "bytes": 387,
+      "path": ".gitignore",
+      "sha256": "547190a2c83f7d5ed8ceeb225dbd94f1632d988015451f58d59ee3dd4a5e3a6b"
+    },
+    {
+      "bytes": 1261,
+      "path": "DATA_LICENSE_NOTICE.md",
+      "sha256": "e97761e27ad8fadf8604050624f51a0b0358d45e95868cec0a736585d97bc9ca"
+    },
+    {
+      "bytes": 3412,
+      "path": "DESIGN.md",
+      "sha256": "a4876724fd2d886165d92a626ec07ac63f6371797d2fbc60344e45c96895b426"
+    },
+    {
+      "bytes": 837,
+      "path": "PROJECT_LICENSE_STATUS.md",
+      "sha256": "0286c06af664dfd6bcb5348dd3b5ff7622440ef39b9a9a177a4b883aa1439bb7"
+    },
+    {
+      "bytes": 3167,
+      "path": "PUBLIC_DATA_GUIDE.md",
+      "sha256": "e4c5e6cab00544b01db2b2c2172ea6be260b4e8f7fa5f193da69cfceebd7c327"
+    },
+    {
+      "bytes": 2573,
+      "path": "README.md",
+      "sha256": "f330fbe8ceb2c85a6941d204b5be2f7402a7647bb1e4035269e506b82668a8b2"
+    },
+    {
+      "bytes": 2106,
+      "path": "THIRD_PARTY_NOTICES.md",
+      "sha256": "89acdc985e17d98c093457476d97256b8e27450fd03973e56798bcb7326787bc"
+    },
+    {
+      "bytes": 59334,
+      "path": "app.js",
+      "sha256": "6c94e96e34131231245c21c14cf905163d41d45b0d44d139154b14e06c12e3f5"
+    },
+    {
+      "bytes": 21945,
+      "path": "archive_data.py",
+      "sha256": "81a73355b67d7c2e0492ea733c0c78c6399208556e6facfb7ba998e6e8239475"
+    },
+    {
+      "bytes": 34885,
+      "path": "engine.py",
+      "sha256": "be2bcac94705f50461d0bdc8e672366fdf6bbb1c400ed36d8d56c933a2a6b653"
+    },
+    {
+      "bytes": 195,
+      "path": "favicon.svg",
+      "sha256": "9e5620bd86d7c439d16ad8721e187e14dee5b10f201022c342c628f679158781"
+    },
+    {
+      "bytes": 1078,
+      "path": "forward_policy_v5_addendum.json",
+      "sha256": "e6138671a8125e2920039f38cd9d64d7c6b0abfc2fb38d0578ecd5bb7494fae9"
+    },
+    {
+      "bytes": 65,
+      "path": "forward_policy_v5_addendum.json.sha256",
+      "sha256": "fed06b6ddd734bcf280abbe079e125823982d417a90998b35216b91b64b0992c"
+    },
+    {
+      "bytes": 85116,
+      "path": "forward_v5.py",
+      "sha256": "9bf41fd22771fcf1a9d2a1022c9cd63d02ad5d0b791bec7365cb9819ad2d6e04"
+    },
+    {
+      "bytes": 32860,
+      "path": "index.html",
+      "sha256": "60ca81de5d8555978bd538aa6da2aec62bf1d01669460ba0d7506e8ceb8d12fe"
+    },
+    {
+      "bytes": 11924,
+      "path": "market.py",
+      "sha256": "2fe64552a231de359189e3b8b5c003e1605f793100ba4b231b994f0daeb12cc8"
+    },
+    {
+      "bytes": 10811,
+      "path": "research.py",
+      "sha256": "3a471b068954aba9e1098d5e05302fe1a1cefee57774ce1b7b7afe305b84dd59"
+    },
+    {
+      "bytes": 1496,
+      "path": "research_cli.py",
+      "sha256": "15c1e5ca84dd8f37042fe69870bf57c3e802384196b9c7de91ee51f97235d9bc"
+    },
+    {
+      "bytes": 15025,
+      "path": "research_jesse_cli.py",
+      "sha256": "26a4a02d9270c41cb4f43b44bc085be3955942180067b1a453fe7f9b2a079347"
+    },
+    {
+      "bytes": 12665,
+      "path": "research_jobs.py",
+      "sha256": "95c838eee87637d225eda235f5ee0a4017bfa0f6cc1e530a52d58b65024e9bd2"
+    },
+    {
+      "bytes": 12680,
+      "path": "research_protocol_jesse.json",
+      "sha256": "dc859aa19ac18ce0b756f8ab8c4799d41c8945b63fb03725b85c38cf84deb230"
+    },
+    {
+      "bytes": 9453,
+      "path": "research_protocol_v4.json",
+      "sha256": "7f6b05b6edd89ada8dcda0fdd54e2bef702b9a0d8eeea02a8ed8e24bd31f140d"
+    },
+    {
+      "bytes": 65,
+      "path": "research_protocol_v4.sha256",
+      "sha256": "bfdef60e418ab12a3d4edc7741e60dde401f7f5e7386d9589b35306c3700529d"
+    },
+    {
+      "bytes": 10021,
+      "path": "research_protocol_v5_exploratory.json",
+      "sha256": "9c379066e30c8a305e2444785e096c42a6e7824f5e80b6fe565fd938112cdfa6"
+    },
+    {
+      "bytes": 12248,
+      "path": "research_v5_cli.py",
+      "sha256": "a494460899440c2c0a3519297bdb0f263ef86d7c0f9d7c116b54edcf8bfc09a3"
+    },
+    {
+      "bytes": 10284,
+      "path": "research_v5_view.py",
+      "sha256": "1560227ae8fd91d21e215be34691bb1c31317578be9d97577cf3edbaaa09e447"
+    },
+    {
+      "bytes": 11023,
+      "path": "server.py",
+      "sha256": "6a0597c2ac6772cc7cb670bead76fb632024ea3b8b2f3c390ae8203c91812be9"
+    },
+    {
+      "bytes": 51242,
+      "path": "styles.css",
+      "sha256": "cbf9ae9ad48680aa61f471b62c6917cc0f4fe071461f130a9705a7f171aece31"
+    },
+    {
+      "bytes": 48329,
+      "path": "test_forward_v5.py",
+      "sha256": "f81f48a4a7cadb78919b4a1de2ffaaf1cec1d461bfc2368fc831ad2d1c91853a"
+    },
+    {
+      "bytes": 15342,
+      "path": "test_jesse.py",
+      "sha256": "9c37931ca4495c18d621e1f0adfeb910ae61be063f8c1091dceab17413f411b9"
+    },
+    {
+      "bytes": 26811,
+      "path": "test_lab.py",
+      "sha256": "0e23d068db91f6ae85186ec5cc9c362e251c2633c07db6d08bcaf874950f053b"
+    },
+    {
+      "bytes": 35610,
+      "path": "test_v4.py",
+      "sha256": "0eee09a3410bcbbb1d3198e9de3bcddb8ad73dd9ee697b5827dc0bf2b3cdbc1b"
+    },
+    {
+      "bytes": 15150,
+      "path": "test_v5.py",
+      "sha256": "ca5dffe9466b789f531e609612555b28f8383698d546d85eeb16aeb3392955a8"
+    },
+    {
+      "bytes": 1065,
+      "path": "third_party/jesse/LICENSE",
+      "sha256": "80d873148413a3eb2f96bbe22657bf57ae42046e4d95e81852109c5f3a949d2d"
+    },
+    {
+      "bytes": 36127,
+      "path": "walkforward.py",
+      "sha256": "d1940057dd93ae33e46edb27e17a4a458ff0bf2478d9cc1164d8e6c833e0e202"
+    },
+    {
+      "bytes": 22945,
+      "path": "walkforward_jesse.py",
+      "sha256": "245ca63b4ac6a49afb8b01ad0350ec54841f4566745464d9a75cc9bd3f1e493c"
+    },
+    {
+      "bytes": 18963,
+      "path": "walkforward_v5.py",
+      "sha256": "5507b0d1a119bcc416ecdeea9b0e5be647c0d874de79ac973e1b813f0f8f5e4e"
+    }
+  ],
+  "heuristic_privacy_scan": {
+    "files_scanned": 37,
+    "finding_count": 0,
+    "scope_note": "Heuristic only; excludes private SQLite databases, images, and files outside this explicit source allowlist."
+  },
+  "historical_result_preview_included": false,
+  "manifest_note": "This embedded manifest hashes every allowed source member except itself. The external release manifest records this file and ZIP hashes.",
+  "product": "RKO",
+  "repository_target": "FrancisGiann/rko",
+  "schema_version": 1,
+  "scope": "source, tests, protocol descriptions, notices; no market data or derived study outputs",
+  "status": "staged for review; not published",
+  "syntax_checks": {
+    "node_check_app_js": "passed",
+    "python_compile": "passed"
+  },
+  "test_suite": {
+    "command": "nice -n 19 python3 -m unittest discover -v",
+    "failed": 0,
+    "fixture_only": true,
+    "passed": 138,
+    "tests": 138
+  }
+}

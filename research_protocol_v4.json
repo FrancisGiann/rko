@@ -1,0 +1,175 @@
+{
+  "id": "crypto-lab-v4-fixed-2019-2026-4h-daily",
+  "version": 4,
+  "frozen_before_outcome_analysis": true,
+  "created_utc": "2026-10-31T19:20:49.327455Z",
+  "purpose": "Personal, non-production historical research only; never arms or supplies models to the legacy public-data paper accounts.",
+  "dataset": {
+    "source": "Binance official public spot archive",
+    "base_url": "https://data.binance.vision/data/spot/monthly/klines",
+    "symbols": [
+      "BTCUSDT",
+      "ETHUSDT"
+    ],
+    "quote_asset": "USDT, not USD",
+    "bar_interval": "4h",
+    "bar_seconds": 14400,
+    "first_month": "2019-10",
+    "last_month": "2026-09",
+    "start_inclusive_utc": "2019-10-01T00:00:00Z",
+    "end_exclusive_utc": "2026-10-01T00:00:00Z",
+    "months_per_symbol": 84,
+    "expected_bars_per_symbol": 15342,
+    "timestamps": "Integer milliseconds before 2025; integer microseconds from 2025. Normalize explicitly without floating timestamp conversion.",
+    "integrity": "Verify each published SHA256 before parsing. Require exact symbol/interval/month/member identity, bounded ZIP and CSV, finite positive OHLC with valid ranges, nonnegative volumes/trades, exact UTC bar/close boundaries. Reject conflicting or duplicate bars and overlong, future, misaligned or out-of-range rows. For an otherwise valid aligned in-month historical row with the expected timestamp unit and a positive declared duration shorter than four hours, reject the row and record its timestamp, duration and missing slot; never round, extend or use its OHLCV. Report all missing slots; no forward filling.",
+    "coverage_policy": "All 168 monthly archives must be verified before evaluation; missing slots invalidate affected lookbacks/targets and are reported. Never change the date window because of returns.",
+    "licensing": "Dataset and derived results/charts/models: CC BY-NC-SA 4.0 under Binance dataset terms. Personal non-production research only; no commercial/live proprietary trading use. Code licensing is separate."
+  },
+  "decision": {
+    "frequency": "daily at 00:00 UTC",
+    "available_information": "Closed bars through the previous day's 20:00-24:00 UTC bar only.",
+    "entry": "04:00 UTC on the signal day, using the actual exchange bar open after a full four-hour delay.",
+    "target_end": "04:00 UTC the following day, actual exchange bar open; 24-hour holding-return label.",
+    "features": [
+      "close return over 1 day (6 bars)",
+      "close return over 3 days (18 bars)",
+      "close return over 7 days (42 bars)",
+      "population standard deviation of 20 daily close returns",
+      "previous day's high-low range divided by latest close",
+      "previous day's base volume / mean base volume of the preceding 20 days minus 1",
+      "latest close / mean of the latest 20 daily closes minus 1"
+    ],
+    "lookback_bars": 126,
+    "gap_policy": "Any missing bar in the 126-bar feature window invalidates that as-of feature decision. A supervised label additionally requires complete signal-to-exit bars and positive volume over its execution window. Missing future label data never removes or changes an earlier feature decision or strategy target. Dataset-start warmup is excluded explicitly.",
+    "label": "1 when actual next-day 04:00 open / signal-day 04:00 open - 1 > 0, before costs.",
+    "zero_volume_execution_guard": "For supervised labels require strictly positive base volume in all actual execution/holding-window bars, including entry and exit bars. At a live simulation entry, require only the observed entry bar to have positive volume; future holding or exit bars cannot retroactively suppress the decision or fill. If a desired execution open is missing or has zero volume, take no fill there and carry an existing position to the next valid observed open. Never claim a fill in a non-trading bar."
+  },
+  "model": {
+    "type": "L2 logistic regression",
+    "train_only_standardization": true,
+    "epochs": 180,
+    "learning_rate": 0.08,
+    "regularization": 0.02,
+    "threshold_grid": [
+      0.5,
+      0.53,
+      0.56,
+      0.59,
+      0.62,
+      0.65
+    ],
+    "selection": "Validation base-cost net return, then lower validation max drawdown, then lower threshold. Comparator p >= threshold. Cash/no-trade outcomes remain valid; no minimum-trade requirement."
+  },
+  "partitions": {
+    "boundary_purge": "Every retained outcome must end strictly before the next partition boundary at 00:00 UTC. No label may reach the next split. The test tail is also bounded by its calendar end.",
+    "development_folds": [
+      {
+        "name": "2022",
+        "train_start": "2019-10-01",
+        "train_end_exclusive": "2021-10-01",
+        "validation_start": "2021-10-01",
+        "validation_end_exclusive": "2022-01-01",
+        "test_start": "2022-01-01",
+        "test_end_exclusive": "2023-01-01"
+      },
+      {
+        "name": "2023",
+        "train_start": "2020-10-01",
+        "train_end_exclusive": "2022-10-01",
+        "validation_start": "2022-10-01",
+        "validation_end_exclusive": "2023-01-01",
+        "test_start": "2023-01-01",
+        "test_end_exclusive": "2024-01-01"
+      },
+      {
+        "name": "2024",
+        "train_start": "2021-10-01",
+        "train_end_exclusive": "2023-10-01",
+        "validation_start": "2023-10-01",
+        "validation_end_exclusive": "2024-01-01",
+        "test_start": "2024-01-01",
+        "test_end_exclusive": "2025-01-01"
+      },
+      {
+        "name": "2025",
+        "train_start": "2022-10-01",
+        "train_end_exclusive": "2024-10-01",
+        "validation_start": "2024-10-01",
+        "validation_end_exclusive": "2025-01-01",
+        "test_start": "2025-01-01",
+        "test_end_exclusive": "2026-01-01"
+      }
+    ],
+    "final": {
+      "name": "final_2026",
+      "train_start": "2023-10-01",
+      "train_end_exclusive": "2025-10-01",
+      "validation_start": "2025-10-01",
+      "validation_end_exclusive": "2026-01-01",
+      "test_start": "2026-01-01",
+      "test_end_exclusive": "2026-10-01"
+    },
+    "final_status": "Newly reserved historical test, retrospective rather than prospective. Freeze final parameters before any final-period evaluation. Record consumed_at on first evaluation; subsequent use is reused historical evidence.",
+    "previously_inspected_exclusion": "October 2026 is excluded from fresh-test claims."
+  },
+  "accounting": {
+    "initial_usdt_per_fold": 10000,
+    "long_only": true,
+    "entry_budget_fraction_including_fees": 0.5,
+    "position_policy": "Daily binary target: enter half-budget when active and flat, hold the same quantity while active, sell when inactive. No daily round-trip or rebalance while target remains active. Liquidate at the final target-end open.",
+    "drawdown_halt": 0.1,
+    "risk_observation": "Daily execution/mark opens only; sell on observed halt, remain in cash until fold end. A gap can overshoot the threshold; no guaranteed stop price.",
+    "reset": "Each strategy/cost/fold begins with fresh 10000 USDT and a fresh risk high-water mark. Development returns are independent fold-reset experiments, not one uninterrupted account.",
+    "baselines": [
+      "positive fixed 7-day momentum with identical target policy",
+      "half-budget buy-and-hold with identical dates/costs/risk halt",
+      "cash"
+    ],
+    "cost_scenarios_bps_per_side": [
+      {
+        "id": "base",
+        "fee": 10,
+        "spread_slippage": 5
+      },
+      {
+        "id": "higher",
+        "fee": 25,
+        "spread_slippage": 10
+      },
+      {
+        "id": "stress",
+        "fee": 50,
+        "spread_slippage": 25
+      }
+    ],
+    "sensitivity": "Select thresholds only at base validation costs; freeze model/threshold/target signals across all cost scenarios. Identical risk rules can halt cost scenarios at different times. Never select a scenario by test performance.",
+    "missing_decision_policy": "No action on invalid/missing daily decisions. An existing position is carried to the next valid observed open; mark and apply risk there. No backfilled trades; gaps can overshoot the halt. Report all excluded daily rows and calendar gaps."
+  },
+  "uncertainty": {
+    "method": "Seeded circular moving-block bootstrap of daily OOS returns and paired daily model-minus-buyhold return differences",
+    "block_days": 7,
+    "replicates": 250,
+    "seed": 41031,
+    "interval": "2.5/97.5 percentiles of compounded bootstrap returns; paired excess uses mean daily excess in basis points.",
+    "interpretation": "Descriptive historical intervals, not a proof of independent returns or an edge. Zero-trade/zero-volatility intervals cannot support a predictive claim. No unguarded annualized Sharpe."
+  },
+  "resource_budget": {
+    "training_jobs": 10,
+    "maximum_train_rows_each": 740,
+    "epochs_each": 180,
+    "bootstrap_replicates": 250,
+    "download_concurrency": 1,
+    "evaluation_workers": 1,
+    "gpu": false,
+    "dependencies": "Python standard library only"
+  },
+  "evaluation_diagnostics": {
+    "classification": [
+      "train-majority prediction baseline",
+      "Brier score",
+      "log loss with numerical probability clipping to [1e-15,1-1e-15]",
+      "fixed reliability bins [0,.1),[.1,.2),...,[.9,1] with counts,mean predicted probability,observed positive share"
+    ],
+    "purpose": "Evaluation diagnostics only; no probability recalibration, threshold changes or model selection on development tests or final test."
+  }
+}
